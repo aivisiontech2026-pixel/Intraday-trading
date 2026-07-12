@@ -1,0 +1,5 @@
+,Total Net P&L,Avg CAGR %,Avg Win Rate %,Avg Max DD %,Avg Sharpe,Profitable Symbols,Total Trades
+ema_crossover,179138.0,0.43,43.9,-4.18,0.25,6/9,98
+supertrend_ema,79799.0,0.18,35.8,-5.25,0.1,5/9,143
+rsi_ema,175101.0,0.4,37.7,-6.24,0.15,5/9,279
+volume_breakout,-199199.0,-0.51,35.5,-6.3,-0.24,4/9,134

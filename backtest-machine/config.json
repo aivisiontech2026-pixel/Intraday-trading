@@ -1,0 +1,27 @@
+{
+  "mode": "paper",
+  "strategy": "ema_crossover",
+  "symbols": [
+    "RELIANCE.NS",
+    "TCS.NS",
+    "INFY.NS",
+    "HDFCBANK.NS",
+    "ICICIBANK.NS",
+    "SBIN.NS",
+    "NIFTYBEES.NS"
+  ],
+  "capital": 1000000,
+  "risk_per_trade": 0.01,
+  "max_daily_loss": 0.02,
+  "max_weekly_loss": 0.05,
+  "max_open_positions": 5,
+  "cost_per_side": 0.001,
+  "telegram": {
+    "bot_token": "8917321372:AAF8uRaMUWxRntJDpSacdc_PrMeS81r2gW4",
+    "chat_id": "8504541463"
+  },
+  "zerodha": {
+    "api_key": "",
+    "access_token": ""
+  }
+}
