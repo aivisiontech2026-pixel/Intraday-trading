@@ -17,7 +17,7 @@ class PaperBroker:
     """No-op broker: the trader simulates fills itself."""
     name = "paper"
 
-    def place_order(self, symbol, side, qty):
+    def place_order(self, symbol, side, qty, product="CNC", variety="amo"):
         return f"PAPER-{side}-{symbol}-{qty}"
 
 
@@ -29,16 +29,20 @@ class ZerodhaBroker:
         self.kite = KiteConnect(api_key=api_key)
         self.kite.set_access_token(access_token)
 
-    def place_order(self, symbol, side, qty):
+    def place_order(self, symbol, side, qty, product="CNC", variety="amo"):
         # yfinance symbol "RELIANCE.NS" -> NSE tradingsymbol "RELIANCE"
+        # product: CNC (delivery/swing) or MIS (intraday, auto square-off)
+        # variety: "amo" for after-market orders, "regular" during hours
         tradingsymbol = symbol.replace(".NS", "")
         return self.kite.place_order(
-            variety=self.kite.VARIETY_AMO,
+            variety=(self.kite.VARIETY_AMO if variety == "amo"
+                     else self.kite.VARIETY_REGULAR),
             exchange=self.kite.EXCHANGE_NSE,
             tradingsymbol=tradingsymbol,
             transaction_type=side,          # "BUY" / "SELL"
             quantity=qty,
-            product=self.kite.PRODUCT_CNC,
+            product=(self.kite.PRODUCT_MIS if product == "MIS"
+                     else self.kite.PRODUCT_CNC),
             order_type=self.kite.ORDER_TYPE_MARKET,
         )
 
