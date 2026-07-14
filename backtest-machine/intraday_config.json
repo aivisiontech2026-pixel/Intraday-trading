@@ -8,7 +8,17 @@
     "TCS.NS",
     "INFY.NS",
     "AXISBANK.NS",
-    "LT.NS"
+    "LT.NS",
+    "WIPRO.NS",
+    "MARUTI.NS",
+    "SUNPHARMA.NS",
+    "HDFC.NS",
+    "BAJAJFINSV.NS",
+    "JSWSTEEL.NS",
+    "NTPC.NS",
+    "ONGC.NS",
+    "ASIANPAINT.NS",
+    "BHARTIARTL.NS"
   ],
   "capital": 100000,
   "max_capital_per_trade": 25000,
