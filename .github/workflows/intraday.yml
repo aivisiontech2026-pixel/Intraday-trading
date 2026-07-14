@@ -9,9 +9,9 @@ name: Intraday Paper Trader
 
 on:
   schedule:
-    # cron is UTC. 09:30-16:25 IST == 04:00-10:55 UTC. Mon-Fri.
-    # (entries 09:30-14:30 IST, forced square-off 15:15 IST — window covers it)
-    - cron: '*/5 4-10 * * 1-5'
+    # cron is UTC. 09:15-16:25 IST == 03:45-10:55 UTC. Mon-Fri.
+    # Runs every 5 min starting at 9:15 IST (market open - 15 min buffer).
+    - cron: '*/5 3-10 * * 1-5'
   workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
 
 permissions:
@@ -50,9 +50,21 @@ jobs:
             echo "No prior state — starting fresh at Rs.1,00,000."
           fi
 
-      - name: Run trader (single pass)
+      - name: Run trader (single pass + telegram alerts)
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: |
           cd backtest-machine
+          # inject telegram secrets into config if provided
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            python << 'EOF'
+          import json
+          cfg = json.load(open("intraday_config.json"))
+          cfg["telegram"] = {"bot_token": "$TG_BOT_TOKEN", "chat_id": "$TG_CHAT_ID"}
+          json.dump(cfg, open("intraday_config.json", "w"), indent=2)
+          EOF
+          fi
           python intraday_trader.py | tee run_output.txt
 
       - name: Save trading state
