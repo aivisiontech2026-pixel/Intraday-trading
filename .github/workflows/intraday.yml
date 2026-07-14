@@ -63,10 +63,14 @@ jobs:
           print("Telegram secrets injected.")
           INJECT
 
-      - name: Run trader (single pass + telegram alerts)
+      - name: Run traders (stocks + options + telegram alerts)
         run: |
           cd backtest-machine
-          python intraday_trader.py | tee run_output.txt
+          echo "=== STOCKS ===" | tee run_output.txt
+          python intraday_trader.py | tee -a run_output.txt
+          echo "" | tee -a run_output.txt
+          echo "=== OPTIONS ===" | tee -a run_output.txt
+          python options_trader.py | tee -a run_output.txt
 
       - name: Save trading state
         if: always()
