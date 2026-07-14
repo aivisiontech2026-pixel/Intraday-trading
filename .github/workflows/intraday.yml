@@ -50,21 +50,22 @@ jobs:
             echo "No prior state — starting fresh at Rs.1,00,000."
           fi
 
-      - name: Run trader (single pass + telegram alerts)
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+      - name: Inject Telegram secrets
+        if: secrets.TG_BOT_TOKEN && secrets.TG_CHAT_ID
         run: |
           cd backtest-machine
-          # inject telegram secrets into config if provided
-          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-            python << 'EOF'
+          python3 << 'INJECT'
           import json
           cfg = json.load(open("intraday_config.json"))
-          cfg["telegram"] = {"bot_token": "$TG_BOT_TOKEN", "chat_id": "$TG_CHAT_ID"}
+          cfg["telegram"]["bot_token"] = "${{ secrets.TG_BOT_TOKEN }}"
+          cfg["telegram"]["chat_id"] = "${{ secrets.TG_CHAT_ID }}"
           json.dump(cfg, open("intraday_config.json", "w"), indent=2)
-          EOF
-          fi
+          print("Telegram secrets injected.")
+          INJECT
+
+      - name: Run trader (single pass + telegram alerts)
+        run: |
+          cd backtest-machine
           python intraday_trader.py | tee run_output.txt
 
       - name: Save trading state
