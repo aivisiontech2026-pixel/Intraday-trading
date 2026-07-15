@@ -66,6 +66,23 @@ jobs:
           print("Telegram secrets injected.")
           INJECT
 
+      - name: Test Telegram
+        run: |
+          python3 << 'TEST'
+          import json, requests
+          cfg = json.load(open("backtest-machine/intraday_config.json"))
+          tg = cfg.get("telegram", {})
+          if tg.get("bot_token") and tg.get("chat_id"):
+              try:
+                  r = requests.post(
+                      f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
+                      json={"chat_id": tg["chat_id"], "text": "🚀 Bot active - testing Telegram"},
+                      timeout=5)
+                  print(f"Telegram: {r.status_code}")
+              except Exception as e:
+                  print(f"Telegram error: {e}")
+          TEST
+
       - name: Run traders (stocks + options + telegram alerts)
         run: |
           cd backtest-machine
