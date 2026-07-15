@@ -2,3 +2,4 @@ numpy>=1.26
 pandas>=2.1
 yfinance>=0.2.40
 requests>=2.31
+kiteconnect>=4.11.0
