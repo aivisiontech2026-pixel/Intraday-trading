@@ -17,8 +17,8 @@
   "max_open_positions": 5,
   "cost_per_side": 0.001,
   "telegram": {
-    "bot_token": "8917321372:AAF8uRaMUWxRntJDpSacdc_PrMeS81r2gW4",
-    "chat_id": "8504541463"
+    "bot_token": "",
+    "chat_id": ""
   },
   "zerodha": {
     "api_key": "",

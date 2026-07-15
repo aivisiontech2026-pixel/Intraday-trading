@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+backtest-machine/config.json
+backtest-machine/intraday_config.json
