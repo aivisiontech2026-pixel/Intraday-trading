@@ -28,10 +28,10 @@ jobs:
       TZ: Asia/Kolkata     # make date.today()/now() IST, matching the strategy
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.3.1
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.13'
           cache: pip
@@ -50,22 +50,30 @@ jobs:
             echo "No prior state — starting fresh at Rs.1,00,000."
           fi
 
-      - name: Run trader (single pass + telegram alerts)
+      - name: Inject Telegram secrets
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        if: env.TG_BOT_TOKEN != '' && env.TG_CHAT_ID != ''
         run: |
           cd backtest-machine
-          # inject telegram secrets into config if provided
-          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-            python << 'EOF'
-          import json
+          python3 << 'INJECT'
+          import json, os
           cfg = json.load(open("intraday_config.json"))
-          cfg["telegram"] = {"bot_token": "$TG_BOT_TOKEN", "chat_id": "$TG_CHAT_ID"}
+          cfg["telegram"]["bot_token"] = os.environ["TG_BOT_TOKEN"]
+          cfg["telegram"]["chat_id"] = os.environ["TG_CHAT_ID"]
           json.dump(cfg, open("intraday_config.json", "w"), indent=2)
-          EOF
-          fi
-          python intraday_trader.py | tee run_output.txt
+          print("Telegram secrets injected.")
+          INJECT
+
+      - name: Run traders (stocks + options + telegram alerts)
+        run: |
+          cd backtest-machine
+          echo "=== STOCKS ===" | tee run_output.txt
+          python intraday_trader.py | tee -a run_output.txt
+          echo "" | tee -a run_output.txt
+          echo "=== OPTIONS ===" | tee -a run_output.txt
+          python options_trader.py | tee -a run_output.txt
 
       - name: Save trading state
         if: always()
