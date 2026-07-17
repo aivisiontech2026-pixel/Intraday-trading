@@ -26,6 +26,19 @@ DB = HERE / "options_trades.db"
 CFG_FILE = HERE / "intraday_config.json"
 CFG = json.loads(CFG_FILE.read_text()) if CFG_FILE.exists() else {}
 
+# ----------------------------------------------------------------- telegram ---
+def telegram(msg):
+    tg = CFG.get("telegram", {})
+    if not (tg.get("bot_token") and tg.get("chat_id")):
+        return
+    import requests
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
+            json={"chat_id": tg["chat_id"], "text": msg}, timeout=10)
+    except Exception as e:
+        print(f"  (telegram alert failed: {e})")
+
 CAPITAL = 100_000  # shared capital pool
 MAX_PER_TRADE = 5_000  # options premium exposure per trade
 PROFIT_TARGET = 0.20  # exit at +20%
@@ -150,8 +163,9 @@ def open_option(conn, spot, option_type, symbol, today, log):
         (symbol, option_type, strike, expiry_str, qty, premium, datetime.now().isoformat()))
     meta_set(conn, "cash", cash(conn) - cost)
 
-    log.append(f"BOUGHT {qty} {symbol} {option_type} {strike} @ Rs.{premium:.2f} "
-               f"(exp {expiry_str}, DTE={dte})")
+    msg = f"📊 OPTIONS: BOUGHT {qty} {symbol} {option_type} {strike} @ Rs.{premium:.2f} (DTE={dte})"
+    log.append(msg)
+    telegram(msg)
     return True
 
 def close_option(conn, pos, exit_price, reason, log):
@@ -170,8 +184,10 @@ def close_option(conn, pos, exit_price, reason, log):
     conn.execute("DELETE FROM options_positions WHERE id=?", (pos["id"],))
     meta_set(conn, "cash", cash(conn) + proceeds)
 
-    log.append(f"SOLD {qty} {pos['symbol']} {pos['option_type']} {pos['strike']} "
-               f"@ Rs.{exit_price:.2f} ({reason}) P&L Rs.{pnl:,.0f} ({pnl_pct:+.1f}%)")
+    emoji = "✅" if pnl > 0 else "❌"
+    msg = f"{emoji} OPTIONS: SOLD {qty} {pos['symbol']} {pos['option_type']} {pos['strike']} @ Rs.{exit_price:.2f} | P&L Rs.{pnl:,.0f} ({pnl_pct:+.1f}%) | {reason}"
+    log.append(msg)
+    telegram(msg)
     return pnl
 
 def process(conn, log, today):
@@ -259,16 +275,20 @@ def main():
     positions = conn.execute("SELECT symbol,option_type,strike,qty,entry_price "
                             "FROM options_positions").fetchall()
     if not positions:
-        print(f"[{datetime.now():%H:%M}] Options: no open positions | Cash: Rs.{cash(conn):,.0f}")
+        status = f"[{datetime.now():%H:%M}] Options: no open positions | Cash: Rs.{cash(conn):,.0f}"
     else:
-        print(f"[{datetime.now():%H:%M}] Options: {len(positions)} open position(s)")
-        for sym, opt_type, strike, qty, entry in positions:
-            print(f"  {sym} {opt_type} {strike} x{qty} @ {entry:.2f}")
+        status = f"[{datetime.now():%H:%M}] Options: {len(positions)} open position(s)"
+
+    print(status)
+    for sym, opt_type, strike, qty, entry in positions:
+        print(f"  {sym} {opt_type} {strike} x{qty} @ {entry:.2f}")
 
     # Process
     process(conn, log, today)
     if log:
         print("\n".join(log))
+        # Send summary to telegram
+        telegram(f"📊 Options Summary:\n" + "\n".join(log))
 
     conn.close()
 
