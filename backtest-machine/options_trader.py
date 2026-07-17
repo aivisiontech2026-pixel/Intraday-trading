@@ -192,6 +192,13 @@ def close_option(conn, pos, exit_price, reason, log):
 
 def process(conn, log, today):
     """Process options signals and manage positions."""
+    # Send market open message once per day
+    if not meta_get(conn, f"market_open_msg:{today}"):
+        msg = f"🔔 OPTIONS MARKET OPENED | {today} 09:15 IST\n💰 Capital: Rs.{cash(conn):,.0f}"
+        log.append(msg)
+        telegram(msg)
+        meta_set(conn, f"market_open_msg:{today}", "1")
+
     # Fetch NIFTY and BANKNIFTY
     try:
         nifty_df = yf.download(NIFTY, period="5d", interval=INTERVAL,

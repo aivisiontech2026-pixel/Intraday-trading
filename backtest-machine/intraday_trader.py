@@ -156,6 +156,10 @@ def process(conn, broker, log):
     today = date.today()
     if meta_get(conn, f"day_start_eq:{today}") is None:
         meta_set(conn, f"day_start_eq:{today}", cash(conn))
+        # Send market open message once per day
+        msg = f"🔔 MARKET OPENED | {today} 09:15 IST\n📈 Capital: Rs.{cash(conn):,.0f}"
+        log.append(msg)
+        telegram(msg)
 
     # NIFTY regime
     ndf = yf.download(NIFTY, period="5d", interval=INTERVAL, auto_adjust=True,
