@@ -83,14 +83,10 @@ jobs:
                   print(f"Telegram error: {e}")
           TEST
 
-      - name: Run traders (stocks + options + telegram alerts)
+      - name: Run simple trader (market open strategy)
         run: |
           cd backtest-machine
-          echo "=== STOCKS ===" | tee run_output.txt
-          python intraday_trader.py | tee -a run_output.txt
-          echo "" | tee -a run_output.txt
-          echo "=== OPTIONS ===" | tee -a run_output.txt
-          python options_trader.py | tee -a run_output.txt
+          python simple_trader.py | tee run_output.txt
 
       - name: Save trading state
         if: always()
