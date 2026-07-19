@@ -1,0 +1,113 @@
+name: Pre-Market AI Analysis
+
+# Two daily jobs on GitHub's servers (PC can be off):
+#   08:15 IST — pre-market analysis: global markets, news sentiment,
+#               technicals, historical similarity -> CALL/PUT/NO TRADE
+#   16:15 IST — after-market learning: grade the morning call, update memory
+#
+# Optional secrets:
+#   TG_BOT_TOKEN / TG_CHAT_ID  — Telegram reports
+#   ANTHROPIC_API_KEY          — adds a Claude AI second opinion to the report
+
+on:
+  schedule:
+    - cron: '45 2 * * 1-5'    # 08:15 IST — pre-market
+    - cron: '45 10 * * 1-5'   # 16:15 IST — after-market learning
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which job to run manually'
+        type: choice
+        options: [premarket, eod]
+        default: premarket
+
+permissions:
+  contents: write
+
+concurrency:
+  group: intraday-trader     # share the lock with the trader (same state branch)
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Kolkata
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: backtest-machine/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r backtest-machine/requirements.txt
+
+      - name: Restore state
+        run: |
+          cd backtest-machine
+          if git fetch origin trading-state --depth 1 2>/dev/null; then
+            for f in intraday_trades.db simple_trades.db options_trades.db market_memory.db; do
+              git show "FETCH_HEAD:$f" > "$f" 2>/dev/null && echo "restored $f" || true
+            done
+          else
+            echo "No prior state."
+          fi
+
+      - name: Inject Telegram secrets
+        run: |
+          cd backtest-machine
+          python3 - "$TG_BOT_TOKEN" "$TG_CHAT_ID" << 'INJECT'
+          import json, sys
+          cfg = json.load(open("intraday_config.json"))
+          bot, chat = sys.argv[1], sys.argv[2]
+          if bot and chat:
+              cfg["telegram"] = {"bot_token": bot, "chat_id": chat}
+              json.dump(cfg, open("intraday_config.json", "w"), indent=2)
+              print("Telegram secrets injected.")
+          else:
+              print("Telegram secrets missing - reports go to log only.")
+          INJECT
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+      # scheduled: pick the job by which cron fired; manual: by the input
+      - name: Run pre-market analysis
+        if: github.event.schedule == '45 2 * * 1-5' || (github.event_name == 'workflow_dispatch' && inputs.job == 'premarket')
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          cd backtest-machine
+          python premarket_analyzer.py
+
+      - name: Run after-market learning
+        if: github.event.schedule == '45 10 * * 1-5' || (github.event_name == 'workflow_dispatch' && inputs.job == 'eod')
+        run: |
+          cd backtest-machine
+          python eod_learner.py
+
+      - name: Save state
+        if: always()
+        run: |
+          cd backtest-machine
+          tmp="$(mktemp -d)"
+          found=0
+          for f in intraday_trades.db simple_trades.db options_trades.db market_memory.db; do
+            [ -f "$f" ] && cp "$f" "$tmp/" && found=1
+          done
+          [ "$found" = "1" ] || { echo "Nothing to save."; exit 0; }
+          cd "$tmp"
+          git init -q
+          git checkout -q -b trading-state
+          git add -A
+          git -c user.name="intraday-ci" \
+              -c user.email="ci@users.noreply.github.com" \
+              commit -q -m "state $(date -u +%FT%TZ)"
+          git push -f \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            trading-state

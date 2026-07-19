@@ -44,8 +44,9 @@ jobs:
         run: |
           cd backtest-machine
           if git fetch origin trading-state --depth 1 2>/dev/null; then
-            git show FETCH_HEAD:intraday_trades.db > intraday_trades.db
-            echo "Restored prior state from trading-state branch."
+            for f in intraday_trades.db simple_trades.db options_trades.db market_memory.db; do
+              git show "FETCH_HEAD:$f" > "$f" 2>/dev/null && echo "restored $f" || true
+            done
           else
             echo "No prior state — starting fresh at Rs.1,00,000."
           fi
@@ -92,10 +93,12 @@ jobs:
         if: always()
         run: |
           cd backtest-machine
-          [ -f intraday_trades.db ] || { echo "No db to save."; exit 0; }
           tmp="$(mktemp -d)"
-          cp intraday_trades.db "$tmp/"
-          [ -f run_output.txt ] && cp run_output.txt "$tmp/"
+          found=0
+          for f in intraday_trades.db simple_trades.db options_trades.db market_memory.db run_output.txt; do
+            [ -f "$f" ] && cp "$f" "$tmp/" && found=1
+          done
+          [ "$found" = "1" ] || { echo "Nothing to save."; exit 0; }
           cd "$tmp"
           git init -q
           git checkout -q -b trading-state
