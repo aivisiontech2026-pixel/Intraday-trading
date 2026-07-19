@@ -109,3 +109,19 @@ jobs:
           git push -f \
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
             trading-state
+
+      - name: Publish dashboard (GitHub Pages)
+        if: always()
+        run: |
+          cd backtest-machine
+          python generate_dashboard.py
+          cd site
+          git init -q
+          git checkout -q -b gh-pages
+          git add -A
+          git -c user.name="intraday-ci" \
+              -c user.email="ci@users.noreply.github.com" \
+              commit -q -m "dashboard $(date -u +%FT%TZ)"
+          git push -f \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            gh-pages

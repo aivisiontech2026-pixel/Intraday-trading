@@ -5,6 +5,7 @@ intraday_trades.db
 simple_trades.db
 options_trades.db
 market_memory.db
+site/
 intraday_daily_pnl.csv
 intraday_trades_backtest.csv
 run_output.txt
