@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Intraday Paper Trading Dashboard</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink2: #52514e;
+  --muted: #898781; --grid: #e1e0d9; --base: #c3c2b7;
+  --pos: #2a78d6; --neg: #e34948;
+  --up: #006300; --down: #d03b3b;
+  --border: rgba(11,11,11,0.10);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink2: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --base: #383835;
+    --pos: #3987e5; --neg: #e66767;
+    --up: #0ca30c; --down: #e66767;
+    --border: rgba(255,255,255,0.10);
+  }
+}
+* { box-sizing: border-box; margin: 0; }
+body { background: var(--page); color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 20px; }
+.wrap { max-width: 860px; margin: 0 auto; }
+h1 { font-size: 20px; } h2 { font-size: 15px; color: var(--ink2); margin: 0 0 8px; }
+.stamp { color: var(--muted); font-size: 13px; margin-bottom: 18px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px,1fr));
+  gap: 12px; margin-bottom: 18px; }
+.tile, .card { background: var(--surface); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px; }
+.card { margin-bottom: 18px; overflow-x: auto; }
+.tile .k { font-size: 12.5px; color: var(--ink2); }
+.tile .v { font-size: 26px; font-weight: 650; margin: 2px 0; }
+.tile .sub { font-size: 14px; color: var(--muted); font-weight: 400; }
+.delta { font-size: 13px; } .up { color: var(--up); } .down { color: var(--down); }
+svg { width: 100%; height: auto; display: block; }
+.grid { stroke: var(--grid); stroke-width: 1; }
+.baseline { stroke: var(--base); stroke-width: 1; }
+.tick { fill: var(--muted); font-size: 11px; }
+.bar.pos { fill: var(--pos); } .bar.neg { fill: var(--neg); }
+.bar:hover, .pt:hover { opacity: 0.75; cursor: default; }
+.line { fill: none; stroke: var(--pos); stroke-width: 2; stroke-linejoin: round; }
+.pt { fill: transparent; }
+.pt:hover { fill: var(--pos); stroke: var(--surface); stroke-width: 2; r: 5; }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th { text-align: left; color: var(--ink2); font-weight: 600;
+  border-bottom: 1px solid var(--base); padding: 6px 10px 6px 0; }
+td { border-bottom: 1px solid var(--grid); padding: 6px 10px 6px 0; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+th.num { text-align: right; }
+.empty { color: var(--muted); }
+#tip { position: fixed; pointer-events: none; background: var(--ink);
+  color: var(--page); padding: 4px 9px; border-radius: 6px; font-size: 12.5px;
+  opacity: 0; transition: opacity .08s; z-index: 9; }
+</style></head>
+<body><div class="wrap">
+<h1>Intraday Paper Trading</h1>
+<div class="stamp">Updated 2026-07-24 21:25 IST &middot; paper mode &middot; Rs.100,000 per book</div>
+
+    <div class="tiles">
+      <div class="tile"><div class="k">All-time P&amp;L (paper)</div>
+        <div class="v">Rs.-558</div><span class="delta down">▼ Rs.558</span></div>
+      <div class="tile"><div class="k">Today's realized P&amp;L</div>
+        <div class="v">Rs.0</div><span class="delta up">▲ Rs.0</span></div>
+      <div class="tile"><div class="k">Trades / win rate</div>
+        <div class="v">10 <span class="sub">/ 20%</span></div></div>
+      <div class="tile"><div class="k">AI call accuracy</div>
+        <div class="v">0% <span class="sub">(0 calls)</span></div></div>
+    </div>
+<div class="card"><h2>Daily realized P&amp;L (last 30 days)</h2><svg viewBox="0 0 760 230" role="img" aria-label="Daily profit and loss, last 2 trading days"><line x1="56" y1="204.0" x2="752" y2="204.0" class="grid"/><text x="48" y="208.0" class="tick" text-anchor="end">-400</text><line x1="56" y1="165.6" x2="752" y2="165.6" class="grid"/><text x="48" y="169.6" class="tick" text-anchor="end">-300</text><line x1="56" y1="127.2" x2="752" y2="127.2" class="grid"/><text x="48" y="131.2" class="tick" text-anchor="end">-200</text><line x1="56" y1="88.8" x2="752" y2="88.8" class="grid"/><text x="48" y="92.8" class="tick" text-anchor="end">-100</text><line x1="56" y1="50.4" x2="752" y2="50.4" class="grid"/><text x="48" y="54.4" class="tick" text-anchor="end">0</text><line x1="56" y1="12.0" x2="752" y2="12.0" class="grid"/><text x="48" y="16.0" class="tick" text-anchor="end">100</text><line x1="56" y1="50.4" x2="752" y2="50.4" class="baseline"/><rect class="bar neg" x="222.0" y="50.4" width="26.0" height="68.1" rx="3" data-tip="2026-07-15: Rs.-177"/><text x="235.0" y="222" class="tick" text-anchor="middle">07-15</text><rect class="bar neg" x="568.0" y="50.4" width="26.0" height="146.2" rx="3" data-tip="2026-07-16: Rs.-381"/><text x="581.0" y="222" class="tick" text-anchor="middle">07-16</text></svg></div>
+<div class="card"><h2>Cumulative P&amp;L</h2><svg viewBox="0 0 760 230" role="img" aria-label="Cumulative paper P&L"><line x1="56" y1="204.0" x2="752" y2="204.0" class="grid"/><text x="48" y="208.0" class="tick" text-anchor="end">-600</text><line x1="56" y1="156.0" x2="752" y2="156.0" class="grid"/><text x="48" y="160.0" class="tick" text-anchor="end">-400</text><line x1="56" y1="108.0" x2="752" y2="108.0" class="grid"/><text x="48" y="112.0" class="tick" text-anchor="end">-200</text><line x1="56" y1="60.0" x2="752" y2="60.0" class="grid"/><text x="48" y="64.0" class="tick" text-anchor="end">0</text><line x1="56" y1="12.0" x2="752" y2="12.0" class="grid"/><text x="48" y="16.0" class="tick" text-anchor="end">200</text><line x1="56" y1="60.0" x2="752" y2="60.0" class="baseline"/><polyline points="66.0,102.6 746.0,194.0" class="line"/><circle class="pt" cx="66.0" cy="102.6" r="9" data-tip="2026-07-15: Rs.-177 cumulative"/><circle class="pt" cx="746.0" cy="194.0" r="9" data-tip="2026-07-16: Rs.-558 cumulative"/><text x="66.0" y="222" class="tick" text-anchor="middle">07-15</text><text x="746.0" y="222" class="tick" text-anchor="middle">07-16</text></svg></div>
+<div class="card"><h2>Books</h2>
+<table><tr><th>Book</th><th class="num">Cash</th><th class="num">Trades</th>
+<th class="num">P&amp;L</th></tr><tr><td>Stocks</td><td class='num'>Rs.99,442</td><td class='num'>10</td><td class='num down'>Rs.-558</td></tr><tr><td>Simple</td><td class='num'>Rs.100,000</td><td class='num'>0</td><td class='num up'>Rs.0</td></tr><tr><td>Options</td><td class='num'>Rs.100,000</td><td class='num'>0</td><td class='num up'>Rs.0</td></tr></table></div>
+<div class="card"><h2>Open positions</h2>
+<table><tr><th>Book</th><th>Symbol</th><th class="num">Qty</th>
+<th class="num">Entry</th></tr><tr><td colspan="4" class="empty">No open positions</td></tr></table></div>
+<div class="card"><h2>Recent trades</h2>
+<table><tr><th>Time</th><th>Book</th><th>Symbol</th><th class="num">P&amp;L</th>
+<th>Reason</th></tr><tr><td>2026-07-16 13:35</td><td>Stocks</td><td>BHARTIARTL</td><td class='num down'>Rs.-22</td><td>Trailing stop</td></tr><tr><td>2026-07-16 13:10</td><td>Stocks</td><td>TCS</td><td class='num up'>Rs.11</td><td>Exit signal</td></tr><tr><td>2026-07-16 12:40</td><td>Stocks</td><td>BAJAJFINSV</td><td class='num down'>Rs.-69</td><td>Exit signal</td></tr><tr><td>2026-07-16 11:50</td><td>Stocks</td><td>POWERGRID</td><td class='num up'>Rs.2</td><td>Trailing stop</td></tr><tr><td>2026-07-16 11:45</td><td>Stocks</td><td>SBIN</td><td class='num down'>Rs.-63</td><td>Exit signal</td></tr><tr><td>2026-07-16 11:40</td><td>Stocks</td><td>NTPC</td><td class='num down'>Rs.-58</td><td>Exit signal</td></tr><tr><td>2026-07-16 11:20</td><td>Stocks</td><td>HDFCBANK</td><td class='num down'>Rs.-69</td><td>Exit signal</td></tr><tr><td>2026-07-16 10:35</td><td>Stocks</td><td>RELIANCE</td><td class='num down'>Rs.-112</td><td>Exit signal</td></tr><tr><td>2026-07-15 11:50</td><td>Stocks</td><td>BHARTIARTL</td><td class='num down'>Rs.-76</td><td>Exit signal</td></tr><tr><td>2026-07-15 10:00</td><td>Stocks</td><td>MARUTI</td><td class='num down'>Rs.-101</td><td>Trailing stop</td></tr></table></div>
+<div class="card"><h2>Pre-market AI calls</h2>
+<table><tr><th>Date</th><th>Call</th><th class="num">Conf</th><th>Regime</th>
+<th>Result</th><th class="num">Day&nbsp;move</th><th>Verdict</th></tr><tr><td>2026-07-24</td><td>BUY PUT</td><td class='num'>86%</td><td>Trending Bearish</td><td>pending</td><td class='num'></td><td class=''>-</td></tr><tr><td>2026-07-23</td><td>NO TRADE</td><td class='num'>62%</td><td>Trending Bearish</td><td>FLAT</td><td class='num'>+0.00%</td><td class=''>-</td></tr><tr><td>2026-07-22</td><td>NO TRADE</td><td class='num'>62%</td><td>Range-bound</td><td>FLAT</td><td class='num'>+0.00%</td><td class=''>-</td></tr><tr><td>2026-07-21</td><td>NO TRADE</td><td class='num'>62%</td><td>Low Volatility</td><td>FLAT</td><td class='num'>+0.00%</td><td class=''>-</td></tr><tr><td>2026-07-20</td><td>NO TRADE</td><td class='num'>77%</td><td>Low Volatility</td><td>FLAT</td><td class='num'>+0.00%</td><td class=''>-</td></tr><tr><td>2026-07-19</td><td>NO TRADE</td><td class='num'>62%</td><td>Range-bound</td><td>pending</td><td class='num'></td><td class=''>-</td></tr></table></div>
+</div>
+<div id="tip"></div>
+<script>
+const tip = document.getElementById('tip');
+document.querySelectorAll('[data-tip]').forEach(el => {
+  el.addEventListener('mousemove', e => {
+    tip.textContent = el.dataset.tip;
+    tip.style.left = (e.clientX + 12) + 'px';
+    tip.style.top = (e.clientY - 28) + 'px';
+    tip.style.opacity = 1;
+  });
+  el.addEventListener('mouseleave', () => tip.style.opacity = 0);
+});
+</script>
+</body></html>
