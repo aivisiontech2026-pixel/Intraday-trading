@@ -1,0 +1,2 @@
+[21:25] Simple trader: no open positions | Cash: Rs.100,000
+Total: 0 trades | P&L Rs.0
