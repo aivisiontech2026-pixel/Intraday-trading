@@ -3,10 +3,16 @@ Intraday options paper trader for NIFTY 50 and BANKNIFTY
 ===============================================
 Simulates realistic options prices based on Black-Scholes model.
 
-Strategy:
+Strategy (trend-following, no fixed profit target):
   - Bullish signal -> Buy ATM call
   - Bearish signal -> Buy ATM put
-  - Exit: +20% profit or -10% stop loss (or square-off at 15:15)
+  - Initial stop-loss: -15% of premium, set at entry
+  - Once a trade is up 10%+, a trailing stop activates and ratchets up
+    with the premium's high-water mark (never loosens)
+  - Real-time exit signal: underlying trend reverses against the position
+    (EMA9/21 + VWAP flips) -> exit immediately regardless of P&L
+  - Final exit: trailing/initial stop hit, trend reversal, last day before
+    expiry, or square-off at 15:15 - whichever comes first
 
 Runs every 5 minutes during market hours. State persists in options_trades.db.
 """
@@ -20,6 +26,8 @@ import math
 
 import numpy as np
 import yfinance as yf
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = Path(__file__).parent
 DB = HERE / "options_trades.db"
@@ -40,9 +48,10 @@ def telegram(msg):
         print(f"  (telegram alert failed: {e})")
 
 CAPITAL = 100_000  # shared capital pool
-MAX_PER_TRADE = 5_000  # options premium exposure per trade
-PROFIT_TARGET = 0.20  # exit at +20%
-STOP_LOSS = -0.10  # exit at -10%
+MAX_PER_TRADE = 5_000  # options premium exposure per trade, sized off Rs.100,000 capital
+INITIAL_STOP_PCT = -0.15   # hard stop at entry: -15% of premium
+TRAIL_ACTIVATE_PCT = 0.10  # once up 10%+, start trailing
+TRAIL_PCT = 0.12           # trail 12% below the highest premium seen
 T_SQUARE_OFF = 15 * 60 + 15  # 15:15 IST
 INTERVAL = "5m"
 NIFTY = "^NSEI"
@@ -55,7 +64,8 @@ def db_init():
     CREATE TABLE IF NOT EXISTS options_positions(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT, option_type TEXT, strike REAL, expiry TEXT,
-        qty INTEGER, entry_price REAL, entry_time TEXT);
+        qty INTEGER, entry_price REAL, entry_time TEXT,
+        high_water REAL, stop_price REAL);
     CREATE TABLE IF NOT EXISTS options_trades(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT, option_type TEXT, strike REAL, expiry TEXT,
@@ -63,6 +73,12 @@ def db_init():
         entry_time TEXT, exit_time TEXT, pnl REAL, reason TEXT);
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
     """)
+    # tolerate DBs created before high_water/stop_price existed
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(options_positions)")}
+    if "high_water" not in cols:
+        conn.execute("ALTER TABLE options_positions ADD COLUMN high_water REAL")
+    if "stop_price" not in cols:
+        conn.execute("ALTER TABLE options_positions ADD COLUMN stop_price REAL")
     return conn
 
 def meta_get(conn, key, default=None):
@@ -157,13 +173,16 @@ def open_option(conn, spot, option_type, symbol, today, log):
     if cost > cash(conn):
         return False
 
+    initial_stop = round(premium * (1 + INITIAL_STOP_PCT), 2)
     conn.execute(
-        "INSERT INTO options_positions(symbol,option_type,strike,expiry,qty,entry_price,entry_time) "
-        "VALUES(?,?,?,?,?,?,?)",
-        (symbol, option_type, strike, expiry_str, qty, premium, datetime.now().isoformat()))
+        "INSERT INTO options_positions(symbol,option_type,strike,expiry,qty,entry_price,"
+        "entry_time,high_water,stop_price) VALUES(?,?,?,?,?,?,?,?,?)",
+        (symbol, option_type, strike, expiry_str, qty, premium, datetime.now().isoformat(),
+         premium, initial_stop))
     meta_set(conn, "cash", cash(conn) - cost)
 
-    msg = f"📊 OPTIONS: BOUGHT {qty} {symbol} {option_type} {strike} @ Rs.{premium:.2f} (DTE={dte})"
+    msg = (f"📊 OPTIONS: BOUGHT {qty} {symbol} {option_type} {strike} @ Rs.{premium:.2f} "
+           f"(DTE={dte}, initial stop Rs.{initial_stop:.2f})")
     log.append(msg)
     telegram(msg)
     return True
@@ -225,18 +244,19 @@ def process(conn, log, today):
     now_min = now.hour * 60 + now.minute
 
     # Get positions
-    positions = conn.execute("SELECT id,symbol,option_type,strike,expiry,qty,entry_price "
-                            "FROM options_positions").fetchall()
+    positions = conn.execute("SELECT id,symbol,option_type,strike,expiry,qty,entry_price,"
+                            "high_water,stop_price FROM options_positions").fetchall()
 
     # Manage existing positions
     for pos_row in positions:
-        pos = dict(zip(["id", "symbol", "option_type", "strike", "expiry", "qty", "entry_price"], pos_row))
+        pos = dict(zip(["id", "symbol", "option_type", "strike", "expiry", "qty",
+                       "entry_price", "high_water", "stop_price"], pos_row))
 
         # Update current price
         if pos["symbol"] == "NIFTY":
-            current_price = nifty_spot
+            current_price, direction = nifty_spot, nifty_dir
         else:
-            current_price = bank_spot
+            current_price, direction = bank_spot, bank_dir
 
         if current_price is None:
             continue
@@ -246,13 +266,27 @@ def process(conn, log, today):
         theta_decay = 1 - (0.02 / max(1, dte))
         current_price *= theta_decay
 
-        pnl_pct = ((current_price - pos["entry_price"]) / pos["entry_price"]) if pos["entry_price"] > 0 else 0
+        # Ratchet the trailing stop up (never down) once the trade is in profit
+        high_water = max(pos["high_water"] or pos["entry_price"], current_price)
+        stop_price = pos["stop_price"] or pos["entry_price"] * (1 + INITIAL_STOP_PCT)
+        if high_water >= pos["entry_price"] * (1 + TRAIL_ACTIVATE_PCT):
+            trail_stop = high_water * (1 - TRAIL_PCT)
+            stop_price = max(stop_price, trail_stop)
+        if high_water != pos["high_water"] or stop_price != pos["stop_price"]:
+            conn.execute("UPDATE options_positions SET high_water=?, stop_price=? WHERE id=?",
+                        (high_water, stop_price, pos["id"]))
+            pos["high_water"], pos["stop_price"] = high_water, stop_price
 
-        # Exit on profit target, stop loss, or time
-        if pnl_pct >= PROFIT_TARGET:
-            close_option(conn, pos, current_price, f"+{PROFIT_TARGET*100:.0f}% profit", log)
-        elif pnl_pct <= STOP_LOSS:
-            close_option(conn, pos, current_price, f"{STOP_LOSS*100:.0f}% stop", log)
+        # Real-time exit signal: underlying trend has reversed against the position
+        reversed_ = ((pos["option_type"] == "CALL" and direction == "BEAR") or
+                    (pos["option_type"] == "PUT" and direction == "BULL"))
+
+        if current_price <= stop_price:
+            trailing = high_water > pos["entry_price"] * (1 + TRAIL_ACTIVATE_PCT)
+            reason = "Trailing stop" if trailing else "Initial stop"
+            close_option(conn, pos, current_price, reason, log)
+        elif reversed_:
+            close_option(conn, pos, current_price, "Trend reversal exit", log)
         elif dte <= 1:  # last day before expiry
             close_option(conn, pos, current_price, "Expiry close-out", log)
         elif now_min >= T_SQUARE_OFF:
@@ -279,16 +313,17 @@ def main():
     log = []
 
     # Show status
-    positions = conn.execute("SELECT symbol,option_type,strike,qty,entry_price "
-                            "FROM options_positions").fetchall()
+    positions = conn.execute("SELECT symbol,option_type,strike,qty,entry_price,"
+                            "high_water,stop_price FROM options_positions").fetchall()
     if not positions:
         status = f"[{datetime.now():%H:%M}] Options: no open positions | Cash: Rs.{cash(conn):,.0f}"
     else:
         status = f"[{datetime.now():%H:%M}] Options: {len(positions)} open position(s)"
 
     print(status)
-    for sym, opt_type, strike, qty, entry in positions:
-        print(f"  {sym} {opt_type} {strike} x{qty} @ {entry:.2f}")
+    for sym, opt_type, strike, qty, entry, hw, stop in positions:
+        print(f"  {sym} {opt_type} {strike} x{qty} @ {entry:.2f} "
+              f"(high {hw:.2f}, stop {stop:.2f})")
 
     # Process
     process(conn, log, today)
