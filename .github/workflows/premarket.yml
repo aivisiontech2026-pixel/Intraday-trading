@@ -25,8 +25,9 @@ permissions:
   contents: write
 
 concurrency:
-  group: intraday-trader     # share the lock with the trader (same state branch)
-  cancel-in-progress: false
+  group: premarket-analysis  # own lock - must NOT share the trader's, or these
+  cancel-in-progress: false  # two daily crons queue behind the 5-min trading
+                             # loop for hours and get delayed or cancelled
 
 jobs:
   analyze:
@@ -96,11 +97,19 @@ jobs:
         run: |
           cd backtest-machine
           tmp="$(mktemp -d)"
-          found=0
-          for f in intraday_trades.db simple_trades.db options_trades.db market_memory.db; do
-            [ -f "$f" ] && cp "$f" "$tmp/" && found=1
-          done
-          [ "$found" = "1" ] || { echo "Nothing to save."; exit 0; }
+          # This job only owns market_memory.db. Re-fetch the trader's DBs
+          # fresh right before pushing so a concurrent trading run (own
+          # concurrency group now) never gets clobbered by this job's
+          # possibly-stale restored snapshot of files it doesn't touch.
+          if git fetch origin trading-state --depth 1 2>/dev/null; then
+            for f in intraday_trades.db simple_trades.db options_trades.db; do
+              git show "FETCH_HEAD:$f" > "$tmp/$f" 2>/dev/null || true
+            done
+          fi
+          if [ -f market_memory.db ]; then
+            cp market_memory.db "$tmp/"
+          fi
+          [ -n "$(ls -A "$tmp")" ] || { echo "Nothing to save."; exit 0; }
           cd "$tmp"
           git init -q
           git checkout -q -b trading-state

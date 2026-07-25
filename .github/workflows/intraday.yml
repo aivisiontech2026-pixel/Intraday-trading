@@ -84,21 +84,30 @@ jobs:
                   print(f"Telegram error: {e}")
           TEST
 
-      - name: Run simple trader (market open strategy)
+      - name: Run traders (simple stocks + options)
         run: |
           cd backtest-machine
-          python simple_trader.py | tee run_output.txt
+          echo "=== SIMPLE STOCKS ===" | tee run_output.txt
+          python simple_trader.py | tee -a run_output.txt
+          echo "" | tee -a run_output.txt
+          echo "=== OPTIONS ===" | tee -a run_output.txt
+          python options_trader.py | tee -a run_output.txt
 
       - name: Save trading state
         if: always()
         run: |
           cd backtest-machine
           tmp="$(mktemp -d)"
-          found=0
-          for f in intraday_trades.db simple_trades.db options_trades.db market_memory.db run_output.txt; do
-            [ -f "$f" ] && cp "$f" "$tmp/" && found=1
+          # This job owns intraday_trades.db/simple_trades.db/options_trades.db.
+          # Re-fetch market_memory.db fresh right before pushing so a concurrent
+          # premarket-analysis run (own concurrency group) never gets clobbered.
+          if git fetch origin trading-state --depth 1 2>/dev/null; then
+            git show "FETCH_HEAD:market_memory.db" > "$tmp/market_memory.db" 2>/dev/null || true
+          fi
+          for f in intraday_trades.db simple_trades.db options_trades.db run_output.txt; do
+            [ -f "$f" ] && cp "$f" "$tmp/"
           done
-          [ "$found" = "1" ] || { echo "Nothing to save."; exit 0; }
+          [ -n "$(ls -A "$tmp")" ] || { echo "Nothing to save."; exit 0; }
           cd "$tmp"
           git init -q
           git checkout -q -b trading-state
