@@ -4,8 +4,14 @@ Intraday options paper trader for NIFTY 50 and BANKNIFTY
 Simulates realistic options prices based on Black-Scholes model.
 
 Strategy (trend-following, no fixed profit target):
-  - Bullish signal -> Buy ATM call
-  - Bearish signal -> Buy ATM put
+  - Universe: NIFTY, BANKNIFTY, and the stock symbols in
+    intraday_config.json (all real NSE F&O names)
+  - Bullish signal (EMA9/21 + VWAP) -> Buy ATM call; bearish -> Buy ATM put
+  - Daily quota: if confluence signals alone haven't produced
+    MIN_DAILY_TRADES distinct symbols by mid-session, the shortfall is
+    filled with the strongest-momentum names among the untraded rest
+    (still one option trade per symbol per day, direction from momentum
+    sign) - guarantees at least ~5 option trades most days
   - Initial stop-loss: -15% of premium, set at entry
   - Once a trade is up 10%+, a trailing stop activates and ratchets up
     with the premium's high-water mark (never loosens)
@@ -54,8 +60,15 @@ TRAIL_ACTIVATE_PCT = 0.10  # once up 10%+, start trailing
 TRAIL_PCT = 0.12           # trail 12% below the highest premium seen
 T_SQUARE_OFF = 15 * 60 + 15  # 15:15 IST
 INTERVAL = "5m"
-NIFTY = "^NSEI"
-BANKNIFTY = "^NSEBANK"
+
+MIN_DAILY_TRADES = 5   # guarantee at least this many distinct option trades/day
+MAX_POSITIONS = 8      # concurrent open positions cap (8 x Rs.5,000 = Rs.40,000 of Rs.100,000)
+FALLBACK_START_MIN = 11 * 60  # 11:00 IST - top up the daily quota from here on
+T_ENTRY_START, T_ENTRY_END = 9 * 60 + 30, 14 * 60 + 30
+
+# trading universe: index symbols + every stock in intraday_config.json
+UNIVERSE = [("NIFTY", "^NSEI"), ("BANKNIFTY", "^NSEBANK")] + \
+    [(sym.replace(".NS", ""), sym) for sym in CFG.get("symbols", [])]
 
 # ----------------------------------------------------------------- db ---
 def db_init():
@@ -136,8 +149,17 @@ def get_atm_option_price(spot, option_type, today):
     iv = implied_vol(spot)
     rate = 0.05  # 5% risk-free rate
 
-    # Find ATM strike (round to nearest 100/500)
-    strike_unit = 500 if spot > 50000 else 100
+    # Find ATM strike (finer rounding for lower-priced stock underlyings)
+    if spot > 50000:
+        strike_unit = 500
+    elif spot > 2000:
+        strike_unit = 100
+    elif spot > 500:
+        strike_unit = 50
+    elif spot > 100:
+        strike_unit = 20
+    else:
+        strike_unit = 10
     atm_strike = (spot // strike_unit) * strike_unit
 
     if option_type == "CALL":
@@ -148,13 +170,16 @@ def get_atm_option_price(spot, option_type, today):
     return atm_strike, price, dte
 
 # ----------------------------------------------------------------- signals ---
-def get_nifty_direction(df):
-    """Returns 'BULL', 'BEAR', or None based on EMA crossover."""
+def get_direction(df):
+    """Returns 'BULL', 'BEAR', or None based on EMA9/21 + VWAP confluence."""
     if df is None or df.empty or len(df) < 21:
         return None
     ema9 = df["Close"].ewm(span=9).mean().iloc[-1]
     ema21 = df["Close"].ewm(span=21).mean().iloc[-1]
-    vwap = (df["Close"] * df["Volume"]).sum() / df["Volume"].sum()
+    vol = df["Volume"].sum()
+    if not vol:
+        return None
+    vwap = (df["Close"] * df["Volume"]).sum() / vol
 
     if ema9 > ema21 and df["Close"].iloc[-1] > vwap:
         return "BULL"
@@ -162,7 +187,31 @@ def get_nifty_direction(df):
         return "BEAR"
     return None
 
-def open_option(conn, spot, option_type, symbol, today, log):
+def get_momentum(df, today):
+    """% move today (or over the last dozen bars if today has too few)."""
+    if df is None or df.empty:
+        return 0.0
+    todays = df[df.index.date == today]
+    if len(todays) >= 2:
+        o, c = float(todays["Open"].iloc[0]), float(todays["Close"].iloc[-1])
+    else:
+        window = df.tail(12)
+        if len(window) < 2:
+            return 0.0
+        o, c = float(window["Close"].iloc[0]), float(window["Close"].iloc[-1])
+    return (c - o) / o * 100 if o else 0.0
+
+def symbols_traded_today(conn, today_str):
+    """Distinct symbols already opened today (open or already closed)."""
+    rows = conn.execute(
+        "SELECT DISTINCT symbol FROM options_positions WHERE entry_time LIKE ?",
+        (f"{today_str}%",)).fetchall()
+    rows += conn.execute(
+        "SELECT DISTINCT symbol FROM options_trades WHERE entry_time LIKE ?",
+        (f"{today_str}%",)).fetchall()
+    return {r[0] for r in rows}
+
+def open_option(conn, spot, option_type, symbol, today, log, tag=""):
     """Open an options position."""
     expiry_str = next_expiry(today)
     strike, premium, dte = get_atm_option_price(spot, option_type, today)
@@ -181,8 +230,8 @@ def open_option(conn, spot, option_type, symbol, today, log):
          premium, initial_stop))
     meta_set(conn, "cash", cash(conn) - cost)
 
-    msg = (f"📊 OPTIONS: BOUGHT {qty} {symbol} {option_type} {strike} @ Rs.{premium:.2f} "
-           f"(DTE={dte}, initial stop Rs.{initial_stop:.2f})")
+    msg = (f"📊 OPTIONS: BOUGHT {qty} {symbol} {option_type} {strike} @ Rs.{premium:.2f}"
+           f"{tag} (DTE={dte}, initial stop Rs.{initial_stop:.2f})")
     log.append(msg)
     telegram(msg)
     return True
@@ -211,55 +260,50 @@ def close_option(conn, pos, exit_price, reason, log):
 
 def process(conn, log, today):
     """Process options signals and manage positions."""
+    today_str = today.isoformat()
+
     # Send market open message once per day
-    if not meta_get(conn, f"market_open_msg:{today}"):
-        msg = f"🔔 OPTIONS MARKET OPENED | {today} 09:15 IST\n💰 Capital: Rs.{cash(conn):,.0f}"
+    if not meta_get(conn, f"market_open_msg:{today_str}"):
+        msg = f"🔔 OPTIONS MARKET OPENED | {today_str} 09:15 IST\n💰 Capital: Rs.{cash(conn):,.0f}"
         log.append(msg)
         telegram(msg)
-        meta_set(conn, f"market_open_msg:{today}", "1")
+        meta_set(conn, f"market_open_msg:{today_str}", "1")
 
-    # Fetch NIFTY and BANKNIFTY
-    try:
-        nifty_df = yf.download(NIFTY, period="5d", interval=INTERVAL,
-                               auto_adjust=True, progress=False, multi_level_index=False)
-    except:
-        return
+    # Fetch the whole universe: spot, trend direction, today's momentum
+    data = {}
+    for symbol, ticker in UNIVERSE:
+        try:
+            df = yf.download(ticker, period="5d", interval=INTERVAL,
+                             auto_adjust=True, progress=False, multi_level_index=False)
+        except Exception as e:
+            print(f"  {symbol}: download failed ({e})")
+            continue
+        if df is None or df.empty:
+            continue
+        data[symbol] = {
+            "spot": float(df["Close"].iloc[-1]),
+            "direction": get_direction(df),
+            "momentum": get_momentum(df, today),
+        }
 
-    if nifty_df is None or nifty_df.empty:
-        return
-
-    nifty_spot = float(nifty_df["Close"].iloc[-1])
-    nifty_dir = get_nifty_direction(nifty_df)
-
-    try:
-        bank_df = yf.download(BANKNIFTY, period="5d", interval=INTERVAL,
-                              auto_adjust=True, progress=False, multi_level_index=False)
-    except:
-        bank_df = None
-
-    bank_spot = float(bank_df["Close"].iloc[-1]) if bank_df is not None and not bank_df.empty else None
-    bank_dir = get_nifty_direction(bank_df) if bank_df is not None and not bank_df.empty else None
+    if "NIFTY" not in data:
+        return  # can't proceed without at least the index
 
     now = datetime.now().astimezone()
     now_min = now.hour * 60 + now.minute
 
-    # Get positions
+    # Manage existing positions
     positions = conn.execute("SELECT id,symbol,option_type,strike,expiry,qty,entry_price,"
                             "high_water,stop_price FROM options_positions").fetchall()
 
-    # Manage existing positions
     for pos_row in positions:
         pos = dict(zip(["id", "symbol", "option_type", "strike", "expiry", "qty",
                        "entry_price", "high_water", "stop_price"], pos_row))
 
-        # Update current price
-        if pos["symbol"] == "NIFTY":
-            current_price, direction = nifty_spot, nifty_dir
-        else:
-            current_price, direction = bank_spot, bank_dir
-
-        if current_price is None:
+        info = data.get(pos["symbol"])
+        if info is None:
             continue
+        current_price, direction = info["spot"], info["direction"]
 
         # Time decay (theta): lose 2% per day closer to expiry
         dte = days_to_expiry(pos["expiry"], today)
@@ -292,17 +336,38 @@ def process(conn, log, today):
         elif now_min >= T_SQUARE_OFF:
             close_option(conn, pos, current_price, "Market close 15:15", log)
 
-    # Entry signals (after 09:30, before 14:30)
-    if 9*60+30 <= now_min <= 14*60+30:
-        if nifty_dir == "BULL" and len(positions) < 2:
-            open_option(conn, nifty_spot, "CALL", "NIFTY", today, log)
-        elif nifty_dir == "BEAR" and len(positions) < 2:
-            open_option(conn, nifty_spot, "PUT", "NIFTY", today, log)
+    if not (T_ENTRY_START <= now_min <= T_ENTRY_END):
+        conn.commit()
+        return
 
-        if bank_spot and bank_dir == "BULL" and len(positions) < 4:
-            open_option(conn, bank_spot, "CALL", "BANKNIFTY", today, log)
-        elif bank_spot and bank_dir == "BEAR" and len(positions) < 4:
-            open_option(conn, bank_spot, "PUT", "BANKNIFTY", today, log)
+    traded_today = symbols_traded_today(conn, today_str)
+    open_count = conn.execute("SELECT COUNT(*) FROM options_positions").fetchone()[0]
+
+    # Tier 1: confluence signal entries (EMA9/21 + VWAP)
+    for symbol, info in data.items():
+        if open_count >= MAX_POSITIONS:
+            break
+        if symbol in traded_today or info["direction"] is None:
+            continue
+        option_type = "CALL" if info["direction"] == "BULL" else "PUT"
+        if open_option(conn, info["spot"], option_type, symbol, today, log):
+            traded_today.add(symbol)
+            open_count += 1
+
+    # Tier 2: guarantee at least MIN_DAILY_TRADES/day - fill the shortfall from
+    # the strongest-momentum untraded names once we're past FALLBACK_START_MIN
+    if now_min >= FALLBACK_START_MIN and len(traded_today) < MIN_DAILY_TRADES:
+        candidates = sorted(
+            (item for item in data.items() if item[0] not in traded_today),
+            key=lambda item: -abs(item[1]["momentum"]))
+        for symbol, info in candidates:
+            if len(traded_today) >= MIN_DAILY_TRADES or open_count >= MAX_POSITIONS:
+                break
+            option_type = "CALL" if info["momentum"] >= 0 else "PUT"
+            if open_option(conn, info["spot"], option_type, symbol, today, log,
+                          tag=f" [momentum pick {info['momentum']:+.1f}%]"):
+                traded_today.add(symbol)
+                open_count += 1
 
     conn.commit()
 
