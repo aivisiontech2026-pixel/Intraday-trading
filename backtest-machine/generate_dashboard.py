@@ -7,7 +7,8 @@ Reads all four SQLite state DBs and renders a self-contained HTML dashboard
     python generate_dashboard.py          # writes site/index.html
 
 CI runs this after every trading cycle and pushes site/ to the gh-pages
-branch, so the page updates every ~5 minutes during market hours.
+branch, so the page updates on the same cadence as the trading workflow
+(set by your external trigger) during market hours.
 """
 
 import html

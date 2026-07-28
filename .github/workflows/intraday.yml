@@ -1,8 +1,9 @@
 name: Intraday Paper Trader
 
 # Runs entirely on GitHub's servers, so it trades even when your PC is off.
-# Every ~5 minutes during NSE market hours, on weekdays, it:
-#   restore state -> fetch fresh 5-min bars -> signals -> paper orders -> save state
+# On the cadence configured in your external trigger (cron-job.org, every
+# 15 min) during NSE market hours, on weekdays, it:
+#   restore state -> fetch fresh price data -> signals -> paper orders -> save state
 #
 # The strategy squares off ALL positions at 15:15 IST, so nothing is ever held
 # overnight; between-day state is just cash balance + trade history.
@@ -10,8 +11,8 @@ name: Intraday Paper Trader
 on:
   # No internal `schedule:` trigger - GitHub's own cron scheduler is
   # documented "best effort" and was observed firing only ~1-2x/day instead
-  # of every 5 min. Triggered externally instead (cron-job.org -> this
-  # workflow's workflow_dispatch, every 5 min during market hours).
+  # of the intended cadence. Triggered externally instead (cron-job.org ->
+  # this workflow's workflow_dispatch, every 15 min during market hours).
   workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
 
 permissions:

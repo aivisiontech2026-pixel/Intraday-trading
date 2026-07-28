@@ -20,7 +20,8 @@ Strategy (trend-following, no fixed profit target):
   - Final exit: trailing/initial stop hit, trend reversal, last day before
     expiry, or square-off at 15:15 - whichever comes first
 
-Runs every 5 minutes during market hours. State persists in options_trades.db.
+Runs on the schedule configured in your external trigger (e.g. every 15 min)
+during market hours. State persists in options_trades.db.
 """
 
 import json

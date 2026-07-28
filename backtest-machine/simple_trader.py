@@ -92,8 +92,12 @@ def process(conn, log, today):
     positions = {r[0]: {"qty": r[1], "entry": r[2], "entry_time": r[3]}
                 for r in conn.execute("SELECT symbol,qty,entry,entry_time FROM positions").fetchall()}
 
-    # ---- ENTRY: Buy at 09:30 AM (once per day per stock)
-    if T_ENTRY <= now_min < T_ENTRY + 5:  # 5-min window after open
+    # ---- ENTRY: Buy at market open, once per day (flag-guarded, not a time
+    # window - a narrow window would silently miss entries if the CI job's
+    # polling cadence doesn't happen to land inside it, e.g. every 15 min).
+    entries_done_key = f"entries_done:{today}"
+    if now_min >= T_ENTRY and not meta_get(conn, entries_done_key):
+        meta_set(conn, entries_done_key, "1")
         for sym in SYMBOLS:
             if sym not in positions and sym in prices:
                 entry_px = prices[sym]
