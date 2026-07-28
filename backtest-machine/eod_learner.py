@@ -45,14 +45,23 @@ def main():
         return
     decision, confidence, prev_close = row
 
-    df = yf.download("^NSEI", period="2d", interval="1d", auto_adjust=True,
+    # Use 5-min intraday bars, not the daily candle - Yahoo often hasn't
+    # published today's daily bar yet this soon after close (16:15 IST),
+    # which previously caused this script to silently skip with no alert.
+    df = yf.download("^NSEI", period="1d", interval="5m", auto_adjust=True,
                      progress=False, multi_level_index=False)
-    if df is None or df.empty or str(df.index[-1].date()) != today:
+    if df is None or df.empty:
+        print("No Nifty intraday data available - skipping.")
+        telegram(f"⚠️ After-market learning skipped for {today}: "
+                 f"no Nifty intraday data available.")
+        return
+    todays = df[df.index.date == date.today()]
+    if todays.empty:
         print("No Nifty data for today (holiday?) - skipping.")
         return
 
-    nifty_open = float(df["Open"].iloc[-1])
-    nifty_close = float(df["Close"].iloc[-1])
+    nifty_open = float(todays["Open"].iloc[0])
+    nifty_close = float(todays["Close"].iloc[-1])
     ref = prev_close or nifty_open
     day_chg = round((nifty_close - ref) / ref * 100, 2)
     intraday = round((nifty_close - nifty_open) / nifty_open * 100, 2)
