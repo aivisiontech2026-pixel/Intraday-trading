@@ -295,21 +295,29 @@ def process(conn, log, today):
 
     # Manage existing positions
     positions = conn.execute("SELECT id,symbol,option_type,strike,expiry,qty,entry_price,"
-                            "high_water,stop_price FROM options_positions").fetchall()
+                            "entry_time,high_water,stop_price FROM options_positions").fetchall()
 
     for pos_row in positions:
         pos = dict(zip(["id", "symbol", "option_type", "strike", "expiry", "qty",
-                       "entry_price", "high_water", "stop_price"], pos_row))
+                       "entry_price", "entry_time", "high_water", "stop_price"], pos_row))
 
         info = data.get(pos["symbol"])
         if info is None:
             continue
-        current_price, direction = info["spot"], info["direction"]
+        spot, direction = info["spot"], info["direction"]
 
-        # Time decay (theta): lose 2% per day closer to expiry
+        # Re-price the option via Black-Scholes at the current spot - same
+        # model used at entry. (Previously this used the raw underlying
+        # spot price as a stand-in for the premium, off by orders of
+        # magnitude vs the actual option price - e.g. treating a Rs.1,258
+        # stock price as if it were the Rs.0.75 premium.)
         dte = days_to_expiry(pos["expiry"], today)
-        theta_decay = 1 - (0.02 / max(1, dte))
-        current_price *= theta_decay
+        iv = implied_vol(spot)
+        rate = 0.05
+        if pos["option_type"] == "CALL":
+            current_price = black_scholes_call(spot, pos["strike"], dte, rate, iv)
+        else:
+            current_price = black_scholes_put(spot, pos["strike"], dte, rate, iv)
 
         # Ratchet the trailing stop up (never down) once the trade is in profit
         high_water = max(pos["high_water"] or pos["entry_price"], current_price)
@@ -336,6 +344,34 @@ def process(conn, log, today):
             close_option(conn, pos, current_price, "Expiry close-out", log)
         elif now_min >= T_SQUARE_OFF:
             close_option(conn, pos, current_price, "Market close 15:15", log)
+
+    # Wall-clock square-off safety net: closes anything still open past
+    # 15:15 even if its price fetch failed this cycle - without this, a
+    # missing `info` above means that position is silently skipped forever
+    # and never squared off (this is also defense-in-depth against the
+    # entry_time KeyError bug fixed above, which crashed close_option()
+    # on every exit attempt and left positions permanently unclosed).
+    # Falls back to entry price (breakeven) only when no live price at all.
+    if now_min >= T_SQUARE_OFF:
+        leftover = conn.execute(
+            "SELECT id,symbol,option_type,strike,expiry,qty,entry_price,"
+            "entry_time,high_water,stop_price FROM options_positions").fetchall()
+        for pos_row in leftover:
+            pos = dict(zip(["id", "symbol", "option_type", "strike", "expiry", "qty",
+                           "entry_price", "entry_time", "high_water", "stop_price"], pos_row))
+            info = data.get(pos["symbol"])
+            if info:
+                dte = days_to_expiry(pos["expiry"], today)
+                iv = implied_vol(info["spot"])
+                if pos["option_type"] == "CALL":
+                    px = black_scholes_call(info["spot"], pos["strike"], dte, 0.05, iv)
+                else:
+                    px = black_scholes_put(info["spot"], pos["strike"], dte, 0.05, iv)
+                reason = "Market close 15:15"
+            else:
+                px = pos["entry_price"]
+                reason = "Market close 15:15 (no live price - closed at entry)"
+            close_option(conn, pos, px, reason, log)
 
     if not (T_ENTRY_START <= now_min <= T_ENTRY_END):
         conn.commit()
