@@ -8,10 +8,10 @@ name: Intraday Paper Trader
 # overnight; between-day state is just cash balance + trade history.
 
 on:
-  schedule:
-    # cron is UTC. 09:15-16:25 IST == 03:45-10:55 UTC. Mon-Fri.
-    # Runs every 5 min starting at 9:15 IST (market open - 15 min buffer).
-    - cron: '*/5 3-10 * * 1-5'
+  # No internal `schedule:` trigger - GitHub's own cron scheduler is
+  # documented "best effort" and was observed firing only ~1-2x/day instead
+  # of every 5 min. Triggered externally instead (cron-job.org -> this
+  # workflow's workflow_dispatch, every 5 min during market hours).
   workflow_dispatch: {}   # lets you trigger a manual run from the Actions tab
 
 permissions:
@@ -66,23 +66,6 @@ jobs:
           json.dump(cfg, open("intraday_config.json", "w"), indent=2)
           print("Telegram secrets injected.")
           INJECT
-
-      - name: Test Telegram
-        run: |
-          python3 << 'TEST'
-          import json, requests
-          cfg = json.load(open("backtest-machine/intraday_config.json"))
-          tg = cfg.get("telegram", {})
-          if tg.get("bot_token") and tg.get("chat_id"):
-              try:
-                  r = requests.post(
-                      f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage",
-                      json={"chat_id": tg["chat_id"], "text": "🚀 Bot active - testing Telegram"},
-                      timeout=5)
-                  print(f"Telegram: {r.status_code}")
-              except Exception as e:
-                  print(f"Telegram error: {e}")
-          TEST
 
       - name: Run traders (simple stocks + options)
         run: |

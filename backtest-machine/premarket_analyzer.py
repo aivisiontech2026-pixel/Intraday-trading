@@ -188,7 +188,10 @@ def stock_candidates():
                              multi_level_index=False)
             if df is None or len(df) < 6:
                 continue
-            r5 = (float(df["Close"].iloc[-1]) / float(df["Close"].iloc[-6]) - 1) * 100
+            last, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-6])
+            if last != last or prev != prev or prev == 0:  # NaN / zero guard
+                continue
+            r5 = (last / prev - 1) * 100
             mom.append((sym.replace(".NS", ""), round(r5, 2)))
         except Exception:
             continue

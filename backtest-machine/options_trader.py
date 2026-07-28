@@ -394,8 +394,8 @@ def main():
     process(conn, log, today)
     if log:
         print("\n".join(log))
-        # Send summary to telegram
-        telegram(f"📊 Options Summary:\n" + "\n".join(log))
+        # NOTE: each trade already sent its own Telegram alert inside process()
+        # — do not re-send the whole log here, that duplicates every message.
 
     conn.close()
 

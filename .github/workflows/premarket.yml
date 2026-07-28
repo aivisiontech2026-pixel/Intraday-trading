@@ -10,13 +10,14 @@ name: Pre-Market AI Analysis
 #   ANTHROPIC_API_KEY          — adds a Claude AI second opinion to the report
 
 on:
-  schedule:
-    - cron: '45 2 * * 1-5'    # 08:15 IST — pre-market
-    - cron: '45 10 * * 1-5'   # 16:15 IST — after-market learning
+  # No internal `schedule:` trigger - GitHub's own cron scheduler is
+  # documented "best effort" and was observed firing hours late or getting
+  # cancelled outright. Triggered externally instead (cron-job.org -> this
+  # workflow's workflow_dispatch, at 08:15 and 16:15 IST).
   workflow_dispatch:
     inputs:
       job:
-        description: 'Which job to run manually'
+        description: 'Which job to run (premarket or eod)'
         type: choice
         options: [premarket, eod]
         default: premarket
@@ -79,7 +80,7 @@ jobs:
 
       # scheduled: pick the job by which cron fired; manual: by the input
       - name: Run pre-market analysis
-        if: github.event.schedule == '45 2 * * 1-5' || (github.event_name == 'workflow_dispatch' && inputs.job == 'premarket')
+        if: inputs.job == 'premarket'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -87,7 +88,7 @@ jobs:
           python premarket_analyzer.py
 
       - name: Run after-market learning
-        if: github.event.schedule == '45 10 * * 1-5' || (github.event_name == 'workflow_dispatch' && inputs.job == 'eod')
+        if: inputs.job == 'eod'
         run: |
           cd backtest-machine
           python eod_learner.py

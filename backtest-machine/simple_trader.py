@@ -170,7 +170,8 @@ def main():
 
     if log:
         print("\n".join(log))
-        telegram("\n".join(log))
+        # NOTE: each trade already sent its own Telegram alert inside process()
+        # — do not re-send the whole log here, that duplicates every message.
 
     # All-time P&L
     n, total = conn.execute("SELECT COUNT(*), COALESCE(SUM(pnl),0) FROM trades").fetchone()
