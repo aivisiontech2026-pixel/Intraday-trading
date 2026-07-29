@@ -24,13 +24,21 @@ except ImportError:
 def login():
     """Returns an authenticated SmartConnect session, or None on failure."""
     if not AVAILABLE:
+        print("  Angel One: smartapi-python/pyotp not installed")
         return None
-    api_key = os.environ.get("ANGEL_API_KEY")
-    client_code = os.environ.get("ANGEL_CLIENT_CODE")
-    pin = os.environ.get("ANGEL_PIN")
-    totp_secret = os.environ.get("ANGEL_TOTP_SECRET")
-    if not all([api_key, client_code, pin, totp_secret]):
+    creds = {
+        "ANGEL_API_KEY": os.environ.get("ANGEL_API_KEY"),
+        "ANGEL_CLIENT_CODE": os.environ.get("ANGEL_CLIENT_CODE"),
+        "ANGEL_PIN": os.environ.get("ANGEL_PIN"),
+        "ANGEL_TOTP_SECRET": os.environ.get("ANGEL_TOTP_SECRET"),
+    }
+    missing = [k for k, v in creds.items() if not v]
+    if missing:
+        print(f"  Angel One: credential(s) not set - {', '.join(missing)}")
         return None
+    api_key, client_code, pin, totp_secret = (
+        creds["ANGEL_API_KEY"], creds["ANGEL_CLIENT_CODE"],
+        creds["ANGEL_PIN"], creds["ANGEL_TOTP_SECRET"])
 
     try:
         totp = pyotp.TOTP(totp_secret).now()
