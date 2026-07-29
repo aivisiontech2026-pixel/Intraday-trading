@@ -34,6 +34,8 @@ import math
 import numpy as np
 import yfinance as yf
 
+import angelone_client
+
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 HERE = Path(__file__).parent
@@ -142,17 +144,35 @@ def black_scholes_put(spot, strike, dte, rate, iv):
     put_price = strike * math.exp(-rate * dte/365) * (1 - nd2) - spot * (1 - nd1)
     return max(0.5, put_price)
 
-def next_expiry(today):
-    """Next Thursday (NIFTY/BANKNIFTY weekly expiry)."""
-    days_ahead = 3 - today.weekday()  # 3 = Thursday
-    if days_ahead <= 0:
-        days_ahead += 7
-    return (today + timedelta(days=days_ahead)).isoformat()
+def next_expiry(today, symbol):
+    """Real NSE expiry convention: NIFTY/BANKNIFTY have weekly Thursday
+    expiry; individual stocks only have MONTHLY expiry (last Thursday of
+    the month) - there is no real weekly contract for a single stock.
+    Using the wrong convention for stocks meant simulated entries were
+    often 1-2 days from a (non-existent) expiry, pricing them far too
+    cheap vs the real market."""
+    if symbol in ("NIFTY", "BANKNIFTY"):
+        days_ahead = 3 - today.weekday()  # 3 = Thursday
+        if days_ahead <= 0:
+            days_ahead += 7
+        return (today + timedelta(days=days_ahead)).isoformat()
+    return angelone_client.next_monthly_expiry(today).isoformat()
 
-def get_atm_option_price(spot, option_type, today):
-    """Get realistic ATM option price."""
-    dte = days_to_expiry(next_expiry(today), today)
-    iv = implied_vol(spot)
+def resolve_iv(symbol, strike, option_type, expiry_date, spot, angel_session, iv_cache):
+    """Real market-implied volatility via Angel One when available (cached
+    per symbol+expiry for this run), else the flat guessed IV."""
+    key = (symbol, expiry_date)
+    if key not in iv_cache:
+        iv_cache[key] = angelone_client.fetch_option_iv(angel_session, symbol, expiry_date)
+    opt_code = "CE" if option_type == "CALL" else "PE"
+    real_iv = iv_cache[key].get((strike, opt_code))
+    return real_iv if real_iv else implied_vol(spot)
+
+def get_atm_option_price(spot, option_type, today, symbol, angel_session, iv_cache):
+    """Get a realistic ATM option price, using real market IV when available."""
+    expiry_str = next_expiry(today, symbol)
+    expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+    dte = days_to_expiry(expiry_str, today)
     rate = 0.05  # 5% risk-free rate
 
     # Find ATM strike (finer rounding for lower-priced stock underlyings)
@@ -168,12 +188,15 @@ def get_atm_option_price(spot, option_type, today):
         strike_unit = 10
     atm_strike = (spot // strike_unit) * strike_unit
 
+    iv = resolve_iv(symbol, atm_strike, option_type, expiry_date, spot,
+                    angel_session, iv_cache)
+
     if option_type == "CALL":
         price = black_scholes_call(spot, atm_strike, dte, rate, iv)
     else:  # PUT
         price = black_scholes_put(spot, atm_strike, dte, rate, iv)
 
-    return atm_strike, price, dte
+    return atm_strike, price, dte, expiry_str
 
 # ----------------------------------------------------------------- signals ---
 def get_direction(df):
@@ -217,10 +240,10 @@ def symbols_traded_today(conn, today_str):
         (f"{today_str}%",)).fetchall()
     return {r[0] for r in rows}
 
-def open_option(conn, spot, option_type, symbol, today, log, tag=""):
+def open_option(conn, spot, option_type, symbol, today, log, angel_session, iv_cache, tag=""):
     """Open an options position."""
-    expiry_str = next_expiry(today)
-    strike, premium, dte = get_atm_option_price(spot, option_type, today)
+    strike, premium, dte, expiry_str = get_atm_option_price(
+        spot, option_type, today, symbol, angel_session, iv_cache)
 
     qty = max(1, int(MAX_PER_TRADE / premium))  # quantity based on premium
     cost = qty * premium
@@ -298,6 +321,14 @@ def process(conn, log, today):
     now = datetime.now().astimezone()
     now_min = now.hour * 60 + now.minute
 
+    # Real market IV via Angel One SmartAPI, when credentials are configured.
+    # Logs in fresh every run (TOTP - no token caching needed) and fails
+    # soft: if login or any fetch fails, resolve_iv() falls back to the
+    # guessed IV automatically, so trading never depends on this working.
+    angel_session = angelone_client.login()
+    print(f"  Angel One: {'connected' if angel_session else 'unavailable - using estimated IV'}")
+    iv_cache = {}
+
     # Manage existing positions
     positions = conn.execute("SELECT id,symbol,option_type,strike,expiry,qty,entry_price,"
                             "entry_time,high_water,stop_price FROM options_positions").fetchall()
@@ -317,7 +348,9 @@ def process(conn, log, today):
         # magnitude vs the actual option price - e.g. treating a Rs.1,258
         # stock price as if it were the Rs.0.75 premium.)
         dte = days_to_expiry(pos["expiry"], today)
-        iv = implied_vol(spot)
+        expiry_date = datetime.strptime(pos["expiry"], "%Y-%m-%d").date()
+        iv = resolve_iv(pos["symbol"], pos["strike"], pos["option_type"],
+                        expiry_date, spot, angel_session, iv_cache)
         rate = 0.05
         if pos["option_type"] == "CALL":
             current_price = black_scholes_call(spot, pos["strike"], dte, rate, iv)
@@ -367,7 +400,9 @@ def process(conn, log, today):
             info = data.get(pos["symbol"])
             if info:
                 dte = days_to_expiry(pos["expiry"], today)
-                iv = implied_vol(info["spot"])
+                expiry_date = datetime.strptime(pos["expiry"], "%Y-%m-%d").date()
+                iv = resolve_iv(pos["symbol"], pos["strike"], pos["option_type"],
+                                expiry_date, info["spot"], angel_session, iv_cache)
                 if pos["option_type"] == "CALL":
                     px = black_scholes_call(info["spot"], pos["strike"], dte, 0.05, iv)
                 else:
@@ -392,7 +427,8 @@ def process(conn, log, today):
         if symbol in traded_today or info["direction"] is None:
             continue
         option_type = "CALL" if info["direction"] == "BULL" else "PUT"
-        if open_option(conn, info["spot"], option_type, symbol, today, log):
+        if open_option(conn, info["spot"], option_type, symbol, today, log,
+                       angel_session, iv_cache):
             traded_today.add(symbol)
             open_count += 1
 
@@ -407,6 +443,7 @@ def process(conn, log, today):
                 break
             option_type = "CALL" if info["momentum"] >= 0 else "PUT"
             if open_option(conn, info["spot"], option_type, symbol, today, log,
+                          angel_session, iv_cache,
                           tag=f" [momentum pick {info['momentum']:+.1f}%]"):
                 traded_today.add(symbol)
                 open_count += 1

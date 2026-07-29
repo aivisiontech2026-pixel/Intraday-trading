@@ -69,6 +69,11 @@ jobs:
           INJECT
 
       - name: Run traders (simple stocks + options)
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
         run: |
           cd backtest-machine
           echo "=== SIMPLE STOCKS ===" | tee run_output.txt

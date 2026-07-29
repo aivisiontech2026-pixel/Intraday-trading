@@ -4,3 +4,5 @@ yfinance>=0.2.40
 requests>=2.31
 kiteconnect>=4.11.0
 anthropic>=0.92.0
+smartapi-python>=1.4.8
+pyotp>=2.9.0
