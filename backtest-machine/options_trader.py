@@ -107,9 +107,14 @@ def cash(conn):
 
 # ----------------------------------------------------------------- pricing ---
 def days_to_expiry(expiry_str, ref_date):
-    """Days remaining until option expiry (Thursday for NIFTY/BANKNIFTY)."""
+    """Days remaining until option expiry (Thursday for NIFTY/BANKNIFTY).
+    0 on the expiry day itself - callers (Black-Scholes pricing) already
+    handle dte<=0 as an intrinsic-value fallback, so don't floor this at 1;
+    doing so previously made DTE=1 (the day BEFORE expiry) indistinguishable
+    from DTE=0 (expiry day), causing next-day entries to force-close almost
+    immediately via the dte<=0 close-out check below."""
     exp = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-    return max(1, (exp - ref_date).days)
+    return max(0, (exp - ref_date).days)
 
 def implied_vol(spot, atm_iv=0.20):
     """Simple IV: lower for high spots (low volatility in uptrends)."""
@@ -340,7 +345,7 @@ def process(conn, log, today):
             close_option(conn, pos, current_price, reason, log)
         elif reversed_:
             close_option(conn, pos, current_price, "Trend reversal exit", log)
-        elif dte <= 1:  # last day before expiry
+        elif dte <= 0:  # today IS the expiry day - not the day before
             close_option(conn, pos, current_price, "Expiry close-out", log)
         elif now_min >= T_SQUARE_OFF:
             close_option(conn, pos, current_price, "Market close 15:15", log)
