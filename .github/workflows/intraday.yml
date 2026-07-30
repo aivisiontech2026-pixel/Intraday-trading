@@ -46,7 +46,18 @@ jobs:
           cd backtest-machine
           if git fetch origin trading-state --depth 1 2>/dev/null; then
             for f in intraday_trades.db simple_trades.db options_trades.db market_memory.db; do
-              git show "FETCH_HEAD:$f" > "$f" 2>/dev/null && echo "restored $f" || true
+              # Write to a temp file first - `git show ... > "$f"` truncates/
+              # creates "$f" via shell redirection BEFORE the command even
+              # runs, so a failed git show previously left a silent EMPTY
+              # database in place instead of leaving the file absent,
+              # invisibly resetting that book's state with no error shown.
+              if git show "FETCH_HEAD:$f" > "$f.tmp" 2>/dev/null && [ -s "$f.tmp" ]; then
+                mv "$f.tmp" "$f"
+                echo "restored $f"
+              else
+                rm -f "$f.tmp"
+                echo "WARNING: could not restore $f from trading-state - starting fresh for this file"
+              fi
             done
           else
             echo "No prior state — starting fresh at Rs.1,00,000."

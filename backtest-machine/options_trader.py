@@ -378,7 +378,13 @@ def process(conn, log, today):
             close_option(conn, pos, current_price, reason, log)
         elif reversed_:
             close_option(conn, pos, current_price, "Trend reversal exit", log)
-        elif dte <= 0:  # today IS the expiry day - not the day before
+        elif dte < 0:  # stale/corrupted expiry record only - genuinely past
+            # expiry. NOT "today is expiry day" (dte==0): that's a normal
+            # trading day for a 0DTE contract and should run the full
+            # trailing-stop/trend-reversal strategy same as any other day,
+            # closing only via those signals or the 15:15 square-off below.
+            # (dte<=0 here previously force-closed same-day trades within
+            # 15-30 min of entry, all day, on every real expiry day.)
             close_option(conn, pos, current_price, "Expiry close-out", log)
         elif now_min >= T_SQUARE_OFF:
             close_option(conn, pos, current_price, "Market close 15:15", log)

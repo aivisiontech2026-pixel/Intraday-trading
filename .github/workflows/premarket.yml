@@ -54,7 +54,16 @@ jobs:
           cd backtest-machine
           if git fetch origin trading-state --depth 1 2>/dev/null; then
             for f in intraday_trades.db simple_trades.db options_trades.db market_memory.db; do
-              git show "FETCH_HEAD:$f" > "$f" 2>/dev/null && echo "restored $f" || true
+              # See intraday.yml's Restore step for why this isn't a plain
+              # redirect: a failed git show would otherwise silently leave
+              # an empty database in place with no error shown.
+              if git show "FETCH_HEAD:$f" > "$f.tmp" 2>/dev/null && [ -s "$f.tmp" ]; then
+                mv "$f.tmp" "$f"
+                echo "restored $f"
+              else
+                rm -f "$f.tmp"
+                echo "WARNING: could not restore $f from trading-state - starting fresh for this file"
+              fi
             done
           else
             echo "No prior state."
