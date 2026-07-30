@@ -58,19 +58,33 @@ def _to_ddmmmyyyy(d: date) -> str:
     return d.strftime("%d%b%Y").upper()
 
 
-def last_thursday_of_month(year, month):
-    """The real NSE monthly stock-option expiry: last Thursday of the month."""
+EXPIRY_WEEKDAY = 1  # Tuesday (Mon=0). NSE moved F&O expiry off Thursday;
+                    # verified against a live MARUTI option chain showing
+                    # 25 Aug / 29 Sep / 27 Oct 2026 - all Tuesdays, and all
+                    # exactly the last Tuesday of their month.
+
+
+def last_expiry_weekday_of_month(year, month):
+    """The real NSE monthly stock-option expiry: last Tuesday of the month."""
     first_of_next = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
     last_day = first_of_next - timedelta(days=1)
-    offset = (last_day.weekday() - 3) % 7  # 3 = Thursday
+    offset = (last_day.weekday() - EXPIRY_WEEKDAY) % 7
     return last_day - timedelta(days=offset)
 
 
 def next_monthly_expiry(today: date) -> date:
-    candidate = last_thursday_of_month(today.year, today.month)
-    if candidate < today:
+    """Nearest monthly expiry strictly AFTER today.
+
+    Deliberately excludes today itself: a contract expiring today has
+    essentially no time value left and is a fundamentally different
+    (0DTE) instrument than what this trend-following strategy is built
+    for - and on the real expiry day the contract may no longer be
+    listed/tradeable at all.
+    """
+    candidate = last_expiry_weekday_of_month(today.year, today.month)
+    if candidate <= today:
         y, m = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
-        candidate = last_thursday_of_month(y, m)
+        candidate = last_expiry_weekday_of_month(y, m)
     return candidate
 
 

@@ -145,16 +145,26 @@ def black_scholes_put(spot, strike, dte, rate, iv):
     return max(0.5, put_price)
 
 def next_expiry(today, symbol):
-    """Real NSE expiry convention: NIFTY/BANKNIFTY have weekly Thursday
-    expiry; individual stocks only have MONTHLY expiry (last Thursday of
-    the month) - there is no real weekly contract for a single stock.
-    Using the wrong convention for stocks meant simulated entries were
-    often 1-2 days from a (non-existent) expiry, pricing them far too
-    cheap vs the real market."""
+    """Real NSE expiry convention: NIFTY/BANKNIFTY have WEEKLY expiry;
+    individual stocks only have MONTHLY expiry - there is no real weekly
+    contract for a single stock.
+
+    Expiry weekday is TUESDAY, not Thursday (NSE moved it) - verified
+    against a live MARUTI option chain listing 25 Aug / 29 Sep / 27 Oct
+    2026, all Tuesdays and all the last Tuesday of their month. Using
+    Thursday meant the bot priced contracts against expiry dates that
+    don't exist in the real market (e.g. it treated 30 Jul 2026 as a
+    valid expiry when July's real expiry was 28 Jul), producing
+    near-worthless phantom 0DTE options far cheaper than any real
+    tradeable contract.
+
+    Both branches return a date strictly AFTER today, so the bot never
+    opens a brand-new position in a contract expiring the same day.
+    """
     if symbol in ("NIFTY", "BANKNIFTY"):
-        days_ahead = 3 - today.weekday()  # 3 = Thursday
-        if days_ahead <= 0:
-            days_ahead += 7
+        days_ahead = (angelone_client.EXPIRY_WEEKDAY - today.weekday()) % 7
+        if days_ahead == 0:  # today is expiry day - roll to next week
+            days_ahead = 7
         return (today + timedelta(days=days_ahead)).isoformat()
     return angelone_client.next_monthly_expiry(today).isoformat()
 
