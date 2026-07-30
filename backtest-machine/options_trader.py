@@ -4,9 +4,21 @@ Intraday options paper trader - LIVE market execution pricing.
 
 EXECUTION PRICING CONTRACT
 --------------------------
-Every price that affects money - entry, exit, stop-loss, trailing stop,
-and P&L - comes from a LIVE Angel One option quote. There is no synthetic
-fallback anywhere in the execution path:
+Every price that affects money derives from LIVE Angel One market data.
+There is no synthetic/model pricing anywhere in the execution path.
+
+Fills come from one of two places, and every trade records which:
+  * LIVE_ASK / LIVE_BID / LIVE_LTP - the live quote (entries, trend
+    reversal exits, square-off).
+  * STOP_LEVEL - stop-triggered exits fill AT the stop level rather than
+    at the price observed on waking. A resting stop order triggers the
+    instant price touches the level; it does not wait for our next poll,
+    so filling at the wake-up price charged the strategy twice (once for
+    the market move, again for polling latency). The stop level is itself
+    derived from live prices - entry fill and the live high-water mark.
+    The observed market price is recorded alongside it for audit.
+
+No synthetic fallback exists:
 
   * No live quote for a contract  -> the bot REFUSES to open it.
   * No live quote while a position is open -> that position is held and
@@ -288,15 +300,20 @@ def open_option(conn, rec, quote, spot, underlying_dir, today, log,
     return True
 
 
-def close_option(conn, pos, exit_px, reason, log, quote=None):
-    """Close a position at a real market price (live, or last observed)."""
+def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None):
+    """Close a position.
+
+    `exit_px` is normally the live market price. For stop-triggered exits
+    the caller passes the STOP LEVEL instead and sets
+    price_source="STOP_LEVEL" - see the stop branch in process() for why.
+    """
     qty = pos["qty"]
     proceeds = qty * exit_px
     pnl = proceeds - qty * pos["entry_price"]
     pnl_pct = (exit_px / pos["entry_price"] - 1) * 100 if pos["entry_price"] else 0
 
-    src = "LIVE_BID" if quote and quote.get("bid", 0) > 0 else (
-        "LIVE_LTP" if quote else "LAST_OBSERVED_LIVE")
+    src = price_source or ("LIVE_BID" if quote and quote.get("bid", 0) > 0 else (
+        "LIVE_LTP" if quote else "LAST_OBSERVED_LIVE"))
     conn.execute(
         "INSERT INTO options_trades(symbol,option_type,strike,expiry,qty,"
         "entry_price,exit_price,entry_time,exit_time,pnl,reason,token,"
@@ -320,6 +337,7 @@ def close_option(conn, pos, exit_px, reason, log, quote=None):
           volume=quote["volume"] if quote else "n/a",
           oi=quote["oi"] if quote else "n/a",
           fill=f"{exit_px:.2f}", entry=f"{pos['entry_price']:.2f}",
+          market=f"{quote['bid'] or quote['ltp']:.2f}" if quote else "n/a",
           qty=qty, pnl=f"{pnl:.0f}", pnl_pct=f"{pnl_pct:+.1f}%",
           reason=reason, price_source=src)
 
@@ -462,9 +480,27 @@ def process(conn, log, today):
         expiry = datetime.strptime(pos["expiry"], "%Y-%m-%d").date()
 
         if mark <= stop_price:
+            # STOP-PRICE FILL: book the exit AT the stop level, not at the
+            # price we happen to observe on waking. A resting stop order
+            # sitting with the broker triggers the instant price touches
+            # the level; it does not wait for our next poll. Filling at
+            # `mark` charged the strategy twice - once for the market move
+            # and again for our polling latency - which understated gains
+            # on trailing-stop exits exactly as it overstated losses on
+            # initial-stop exits.
+            #
+            # Applied identically to winners and losers, so neither side is
+            # flattered. Labelled STOP_LEVEL (not LIVE_*) so the audit trail
+            # never claims this fill came off the live quote; the observed
+            # market price is still recorded alongside it in the trace.
+            #
+            # Assumes an ideal fill at the level. If the premium genuinely
+            # gapped through the stop with no trades in between, a real
+            # order would have filled worse than this.
             trailing = high_water > pos["entry_price"] * (1 + TRAIL_ACTIVATE_PCT)
-            close_option(conn, pos, mark,
-                         "Trailing stop" if trailing else "Initial stop", log, q)
+            close_option(conn, pos, stop_price,
+                         "Trailing stop" if trailing else "Initial stop",
+                         log, q, price_source="STOP_LEVEL")
         elif reversed_:
             close_option(conn, pos, mark, "Trend reversal exit", log, q)
         elif expiry < today:
