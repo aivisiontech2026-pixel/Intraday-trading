@@ -10,3 +10,5 @@ intraday_daily_pnl.csv
 intraday_trades_backtest.csv
 run_output.txt
 logs/
+# Angel One instrument master (~35 MB, re-downloaded daily by the client)
+scripmaster_cache.json
