@@ -1,0 +1,74 @@
+name: Verify Live Market Data
+
+# On-demand probe that proves the options pipeline is fetching real live
+# market data. Run it from the Actions tab, then compare the LTP/bid/ask/OI
+# it reports against your broker app. The report is also sent to Telegram
+# so you can compare on the same phone.
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: 'Underlying (e.g. TCS, MARUTI, RELIANCE, NIFTY)'
+        type: string
+        default: 'TCS'
+      strike:
+        description: 'Strike price (e.g. 1840)'
+        type: string
+        default: '1840'
+      option_type:
+        description: 'CE (call) or PE (put)'
+        type: choice
+        options: [CE, PE]
+        default: CE
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Kolkata
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: backtest-machine/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r backtest-machine/requirements.txt
+
+      - name: Inject Telegram secrets
+        run: |
+          cd backtest-machine
+          python3 - "$TG_BOT_TOKEN" "$TG_CHAT_ID" << 'INJECT'
+          import json, sys
+          cfg = json.load(open("intraday_config.json"))
+          bot, chat = sys.argv[1], sys.argv[2]
+          if bot and chat:
+              cfg["telegram"] = {"bot_token": bot, "chat_id": chat}
+              json.dump(cfg, open("intraday_config.json", "w"), indent=2)
+              print("Telegram secrets injected.")
+          else:
+              print("Telegram secrets missing - report will go to the log only.")
+          INJECT
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
+      - name: Verify live market data
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+        run: |
+          cd backtest-machine
+          python verify_live_data.py \
+            "${{ inputs.symbol }}" "${{ inputs.strike }}" "${{ inputs.option_type }}"
