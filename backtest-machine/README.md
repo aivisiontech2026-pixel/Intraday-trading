@@ -1,5 +1,11 @@
 # The Backtest Machine — Indian Stock Market Edition
 
+> **This file documents the offline backtesters only** (`backtest.py`,
+> `intraday_backtest.py`). The project has since grown into a live
+> automated paper-trading system — see the **[project README](../README.md)**
+> for the architecture, the live-data pipeline, the options strategy, and
+> setup instructions.
+
 Python implementation of the backtesting spec in
 `The_Backtest_Machine_Indian_Stock_Market_Edition.docx`.
 
