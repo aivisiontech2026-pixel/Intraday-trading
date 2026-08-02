@@ -102,6 +102,17 @@ jobs:
           cd backtest-machine
           python eod_learner.py
 
+      # Strategy analytics: attribution, learning stats, and the
+      # baseline-vs-ranked shadow comparison. Always printed to the log;
+      # the summary is sent to Telegram. Never fails the job - reporting
+      # must not be able to break the trading pipeline.
+      - name: Strategy analytics report
+        if: inputs.job == 'eod'
+        continue-on-error: true
+        run: |
+          cd backtest-machine
+          python trade_analytics.py --telegram
+
       - name: Save state
         if: always()
         run: |

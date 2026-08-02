@@ -1,1 +1,80 @@
-{"mode": "paper", "symbols": ["RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS", "TCS.NS", "INFY.NS", "AXISBANK.NS", "LT.NS", "WIPRO.NS", "MARUTI.NS", "SUNPHARMA.NS", "POWERGRID.NS", "BAJAJFINSV.NS", "JSWSTEEL.NS", "NTPC.NS", "ONGC.NS", "ASIANPAINT.NS", "BHARTIARTL.NS"], "capital": 100000, "max_capital_per_trade": 25000, "max_open_positions": 4, "risk_per_trade_percent": 1, "max_daily_loss_percent": 2, "max_daily_profit_percent": 5, "cost_per_side": 0.0003, "slippage": 0.0002, "atr_trail_mult": 8.0, "interval": "5m", "period": "60d", "entry_start": "09:30", "entry_end": "14:30", "square_off": "15:15", "telegram": {"bot_token": "", "chat_id": ""}, "zerodha": {"api_key": "", "access_token": ""}}
+{
+  "mode": "paper",
+  "symbols": [
+    "RELIANCE.NS",
+    "HDFCBANK.NS",
+    "ICICIBANK.NS",
+    "SBIN.NS",
+    "TCS.NS",
+    "INFY.NS",
+    "AXISBANK.NS",
+    "LT.NS",
+    "WIPRO.NS",
+    "MARUTI.NS",
+    "SUNPHARMA.NS",
+    "POWERGRID.NS",
+    "BAJAJFINSV.NS",
+    "JSWSTEEL.NS",
+    "NTPC.NS",
+    "ONGC.NS",
+    "ASIANPAINT.NS",
+    "BHARTIARTL.NS"
+  ],
+  "capital": 100000,
+  "max_capital_per_trade": 25000,
+  "max_open_positions": 4,
+  "risk_per_trade_percent": 1,
+  "max_daily_loss_percent": 2,
+  "max_daily_profit_percent": 5,
+  "cost_per_side": 0.0003,
+  "slippage": 0.0002,
+  "atr_trail_mult": 8.0,
+  "interval": "5m",
+  "period": "60d",
+  "entry_start": "09:30",
+  "entry_end": "14:30",
+  "square_off": "15:15",
+  "telegram": {
+    "bot_token": "",
+    "chat_id": ""
+  },
+  "zerodha": {
+    "api_key": "",
+    "access_token": ""
+  },
+  "ranking": {
+    "_comment": "Candidate ranking engine. mode: off | shadow | active. shadow = score+log everything, baseline still decides (safe default). See ranking_engine.py header for the evidence behind these weights.",
+    "mode": "shadow",
+    "weights": {
+      "rel_strength": 0.3,
+      "option_liquidity": 0.25,
+      "trend_quality": 0.1,
+      "momentum": 0.1,
+      "signal_tier": 0.1,
+      "history": 0.1,
+      "risk_reward": 0.05,
+      "market_alignment": 0.0
+    },
+    "tiers": [
+      {
+        "min_score": 0.75,
+        "max_trades": 3
+      },
+      {
+        "min_score": 0.62,
+        "max_trades": 2
+      },
+      {
+        "min_score": 0.52,
+        "max_trades": 1
+      }
+    ],
+    "max_per_sector": 2,
+    "liquidity": {
+      "max_spread_pct": 5.0,
+      "min_oi": 500,
+      "min_volume": 100
+    },
+    "min_history_n": 10
+  }
+}

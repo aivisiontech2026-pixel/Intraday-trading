@@ -63,6 +63,7 @@ from pathlib import Path
 import yfinance as yf
 
 import angelone_client as angel
+import ranking_engine as ranking
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -139,6 +140,17 @@ def db_init():
         ("options_trades", "exit_oi", "INTEGER"),
         ("options_trades", "entry_volume", "INTEGER"),
         ("options_trades", "price_source", "TEXT"),
+        # ranking-engine instrumentation (shadow mode stamps every trade)
+        ("options_positions", "entry_bid", "REAL"),
+        ("options_positions", "entry_ask", "REAL"),
+        ("options_positions", "entry_oi", "INTEGER"),
+        ("options_positions", "entry_volume", "INTEGER"),
+        ("options_positions", "entry_score", "REAL"),
+        ("options_positions", "entry_rank", "INTEGER"),
+        ("options_positions", "entry_tier", "TEXT"),
+        ("options_trades", "entry_score", "REAL"),
+        ("options_trades", "entry_rank", "INTEGER"),
+        ("options_trades", "entry_tier", "TEXT"),
     ]:
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if col not in cols:
@@ -162,7 +174,8 @@ def cash(conn):
 POS_COLS = ["id", "symbol", "option_type", "strike", "expiry", "qty",
             "entry_price", "entry_time", "high_water", "stop_price",
             "token", "trading_symbol", "lots", "lotsize", "last_price",
-            "entry_fair_value"]
+            "entry_fair_value", "entry_bid", "entry_ask", "entry_oi",
+            "entry_volume", "entry_score", "entry_rank", "entry_tier"]
 POS_SELECT = "SELECT " + ",".join(POS_COLS) + " FROM options_positions"
 
 
@@ -200,21 +213,44 @@ def fair_value(spot, rec, today, iv_map):
 
 # ----------------------------------------------------------------- signals ---
 def get_direction(df):
-    """BULL / BEAR / None from EMA9-21 + VWAP confluence on the UNDERLYING."""
+    """BULL / BEAR / None from EMA9-21 + VWAP confluence on the UNDERLYING.
+
+    Indices report ZERO volume on yfinance, so a volume-weighted VWAP is
+    undefined there - previously this returned None unconditionally for
+    NIFTY/BANKNIFTY, silently disabling their confluence signal for the
+    entire life of the bot (found by the signal-quality study, where the
+    market-alignment bucket came back n=0). Falls back to a volume-less
+    proxy (mean close) for that case, same approach as intraday_backtest.
+    """
     if df is None or df.empty or len(df) < 21:
         return None
     ema9 = df["Close"].ewm(span=9).mean().iloc[-1]
     ema21 = df["Close"].ewm(span=21).mean().iloc[-1]
     vol = df["Volume"].sum()
-    if not vol:
-        return None
-    vwap = (df["Close"] * df["Volume"]).sum() / vol
+    if vol:
+        vwap = (df["Close"] * df["Volume"]).sum() / vol
+    else:
+        vwap = df["Close"].mean()
     last = df["Close"].iloc[-1]
     if ema9 > ema21 and last > vwap:
         return "BULL"
     if ema9 < ema21 and last < vwap:
         return "BEAR"
     return None
+
+
+def get_trend_quality(df):
+    """Fraction of the last 12 bars whose EMA9/21 relationship matches the
+    current one. NOTE (evidence): the 60d study found FRESH trends
+    (tq < 1.0) outperformed fully-established ones intraday, so the
+    ranking engine scores freshness higher - see ranking_engine.py."""
+    if df is None or df.empty or len(df) < 21:
+        return 0.5
+    ema9 = df["Close"].ewm(span=9).mean()
+    ema21 = df["Close"].ewm(span=21).mean()
+    up_now = ema9.iloc[-1] > ema21.iloc[-1]
+    tail = (ema9 > ema21).tail(12)
+    return float(tail.mean()) if up_now else float((~tail).mean())
 
 
 def get_momentum(df, today):
@@ -249,9 +285,11 @@ def trace(**fields):
 
 # ----------------------------------------------------------------- orders ---
 def open_option(conn, rec, quote, spot, underlying_dir, today, log,
-                fair, tag=""):
+                fair, tag="", score=None, rank_pos=None, tier=None):
     """Open a position. Entry fills at the live ASK (crossing the spread),
-    falling back to live LTP when there is no depth. Never a model price."""
+    falling back to live LTP when there is no depth. Never a model price.
+    The candidate's ranking-engine score/rank/tier and the full entry
+    quote snapshot are stamped on the position for later attribution."""
     ltp, bid, ask = quote["ltp"], quote["bid"], quote["ask"]
     entry_px = ask if ask > 0 else ltp
     if entry_px <= 0:
@@ -275,11 +313,14 @@ def open_option(conn, rec, quote, spot, underlying_dir, today, log,
     conn.execute(
         "INSERT INTO options_positions(symbol,option_type,strike,expiry,qty,"
         "entry_price,entry_time,high_water,stop_price,token,trading_symbol,"
-        "lots,lotsize,last_price,entry_fair_value) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "lots,lotsize,last_price,entry_fair_value,entry_bid,entry_ask,"
+        "entry_oi,entry_volume,entry_score,entry_rank,entry_tier) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (rec["name"], rec["opt_type"], rec["strike"], rec["expiry"].isoformat(),
          qty, entry_px, datetime.now().isoformat(), entry_px, initial_stop,
-         rec["token"], rec["symbol"], lots, lotsize, entry_px, fair))
+         rec["token"], rec["symbol"], lots, lotsize, entry_px, fair,
+         bid, ask, quote.get("oi"), quote.get("volume"),
+         score, rank_pos, tier))
     meta_set(conn, "cash", cash(conn) - cost)
 
     edge = f"{entry_px - fair:+.2f}" if fair else "n/a"
@@ -290,6 +331,8 @@ def open_option(conn, rec, quote, spot, underlying_dir, today, log,
           signal=underlying_dir, lots=lots, lotsize=lotsize, qty=qty,
           cost=f"{cost:.0f}", stop=f"{initial_stop:.2f}",
           fair_value=f"{fair:.2f}" if fair else "n/a", edge=edge,
+          rank_score=score if score is not None else "n/a",
+          rank=rank_pos if rank_pos is not None else "n/a", tier=tier or "n/a",
           price_source="LIVE_ASK" if ask > 0 else "LIVE_LTP")
 
     msg = (f"📊 OPTIONS: BOUGHT {lots} lot(s) ({qty}) {rec['symbol']} "
@@ -317,15 +360,19 @@ def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None)
     conn.execute(
         "INSERT INTO options_trades(symbol,option_type,strike,expiry,qty,"
         "entry_price,exit_price,entry_time,exit_time,pnl,reason,token,"
-        "trading_symbol,lots,lotsize,exit_bid,exit_ask,exit_oi,price_source) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "trading_symbol,lots,lotsize,exit_bid,exit_ask,exit_oi,price_source,"
+        "entry_bid,entry_ask,entry_oi,entry_volume,entry_score,entry_rank,"
+        "entry_tier) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (pos["symbol"], pos["option_type"], pos["strike"], pos["expiry"], qty,
          pos["entry_price"], exit_px, pos["entry_time"],
          datetime.now().isoformat(), pnl, reason, pos.get("token"),
          pos.get("trading_symbol"), pos.get("lots"), pos.get("lotsize"),
          quote.get("bid") if quote else None,
          quote.get("ask") if quote else None,
-         quote.get("oi") if quote else None, src))
+         quote.get("oi") if quote else None, src,
+         pos.get("entry_bid"), pos.get("entry_ask"), pos.get("entry_oi"),
+         pos.get("entry_volume"), pos.get("entry_score"),
+         pos.get("entry_rank"), pos.get("entry_tier")))
     conn.execute("DELETE FROM options_positions WHERE id=?", (pos["id"],))
     meta_set(conn, "cash", cash(conn) + proceeds)
 
@@ -390,10 +437,17 @@ def process(conn, log, today):
             continue
         data[name] = {"spot": float(df["Close"].iloc[-1]),
                       "direction": get_direction(df),
-                      "momentum": get_momentum(df, today)}
+                      "momentum": get_momentum(df, today),
+                      "trend_quality": get_trend_quality(df)}
     if "NIFTY" not in data:
         print("  No underlying data -> skipping cycle.")
         return
+
+    # relative strength: today's move vs NIFTY's (evidence: the strongest
+    # measured ranking feature - see ranking_engine.py header)
+    nifty_mom = data["NIFTY"]["momentum"]
+    for name, info in data.items():
+        info["rel_strength"] = round(info["momentum"] - nifty_mom, 3)
 
     positions = load_positions(conn)
 
@@ -402,9 +456,9 @@ def process(conn, log, today):
     open_count = len(positions)
     in_window = T_ENTRY_START <= now_min <= T_ENTRY_END
 
-    candidates = []   # (name, rec, direction, tag)
+    candidates = []   # dicts: name/rec/direction/tier/tag + score features
     if in_window:
-        def consider(name, info, direction, tag=""):
+        def consider(name, info, direction, tier, tag=""):
             exp = angel.nearest_expiry(master, name, today, min_dte=1)
             if exp is None:
                 trace(event="entry_skipped", symbol=name, reason="no_listed_expiry")
@@ -414,28 +468,62 @@ def process(conn, log, today):
             if rec is None:
                 trace(event="entry_skipped", symbol=name, reason="no_listed_strike")
                 return
-            candidates.append((name, rec, direction, tag))
+            candidates.append({
+                "name": name, "rec": rec, "direction": direction,
+                "tier": tier, "tag": tag,
+                "momentum": info["momentum"],
+                "rel_strength": info["rel_strength"],
+                "trend_quality": info["trend_quality"],
+            })
 
         for name, info in data.items():
             if name in traded_today or info["direction"] is None:
                 continue
-            consider(name, info, info["direction"])
+            consider(name, info, info["direction"], "confluence")
 
         if now_min >= FALLBACK_START_MIN and len(traded_today) < MIN_DAILY_TRADES:
-            picked = {c[0] for c in candidates}
+            picked = {c["name"] for c in candidates}
             for name, info in sorted(data.items(),
                                      key=lambda kv: -abs(kv[1]["momentum"])):
                 if name in traded_today or name in picked:
                     continue
                 d = "BULL" if info["momentum"] >= 0 else "BEAR"
-                consider(name, info, d,
+                consider(name, info, d, "momentum",
                          tag=f" [momentum {info['momentum']:+.1f}%]")
 
     # ---- ONE batched live-quote call for positions + candidates --------
     tokens = [p["token"] for p in positions if p.get("token")]
-    tokens += [rec["token"] for _, rec, _, _ in candidates]
+    tokens += [c["rec"]["token"] for c in candidates]
     quotes = angel.get_quotes(smart, list(dict.fromkeys(tokens)))
     print(f"  Live quotes: {len(quotes)}/{len(set(tokens))} tokens fetched")
+
+    # ---- ranking engine: score every candidate, every cycle ------------
+    # In "shadow" (default) this ONLY logs and stamps scores - the
+    # baseline keeps deciding. In "active" the ranked selection decides.
+    rcfg = ranking.get_config(CFG)
+    rank_mode = rcfg.get("mode", "shadow")
+    ranked = []
+    if candidates and rank_mode != "off":
+        for c in candidates:
+            c["quote"] = quotes.get(c["rec"]["token"])
+        history = ranking.load_history(conn, rcfg["min_history_n"])
+        ranked = ranking.rank(candidates, data["NIFTY"]["direction"],
+                              rcfg, history)
+        open_sectors = {}
+        for p in positions:
+            sec = ranking.SECTOR.get(p["symbol"], "Other")
+            open_sectors[sec] = open_sectors.get(sec, 0) + 1
+        slots = max(0, MAX_POSITIONS - open_count)
+        picks, rejections = ranking.select(ranked, rcfg, open_sectors, slots)
+        ranking.log_cycle(conn, rank_mode, ranked, picks)
+        for c in ranked:
+            trace(event="rank", symbol=c["name"], rank=c["rank"],
+                  score=c["score"], tier=c["tier"],
+                  would_trade=1 if c in picks else 0)
+        if rank_mode == "active":
+            for c, why in rejections:
+                trace(event="rank_rejected", symbol=c["name"],
+                      score=c["score"], reason=why)
 
     # ---- manage open positions on LIVE prices --------------------------
     for pos in positions:
@@ -513,10 +601,19 @@ def process(conn, log, today):
         return
 
     # ---- entries, on LIVE quotes only ----------------------------------
+    # active mode: trade the ranked picks. shadow/off: baseline order,
+    # with the candidate's score stamped on the trade for attribution.
     open_count = conn.execute(
         "SELECT COUNT(*) FROM options_positions").fetchone()[0]
+    if rank_mode == "active" and ranked:
+        entry_list = picks
+    else:
+        entry_list = candidates
+    score_by_name = {c["name"]: c for c in ranked}
+
     iv_cache = {}
-    for name, rec, direction, tag in candidates:
+    for cand in entry_list:
+        name, rec = cand["name"], cand["rec"]
         if open_count >= MAX_POSITIONS:
             break
         if name in traded_today:
@@ -533,8 +630,11 @@ def process(conn, log, today):
             iv_cache[key] = angel.fetch_option_iv(smart, name, rec["expiry"])
         fair = fair_value(data[name]["spot"], rec, today, iv_cache[key])
 
-        if open_option(conn, rec, q, data[name]["spot"], direction, today,
-                       log, fair, tag):
+        sc = score_by_name.get(name, {})
+        if open_option(conn, rec, q, data[name]["spot"], cand["direction"],
+                       today, log, fair, cand.get("tag", ""),
+                       score=sc.get("score"), rank_pos=sc.get("rank"),
+                       tier=cand.get("tier")):
             traded_today.add(name)
             open_count += 1
 
