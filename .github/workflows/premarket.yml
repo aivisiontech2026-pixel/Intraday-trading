@@ -50,24 +50,11 @@ jobs:
         run: pip install -r backtest-machine/requirements.txt
 
       - name: Restore state
+        env:
+          STATE_REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
         run: |
           cd backtest-machine
-          if git fetch origin trading-state --depth 1 2>/dev/null; then
-            for f in intraday_trades.db simple_trades.db options_trades.db market_memory.db; do
-              # See intraday.yml's Restore step for why this isn't a plain
-              # redirect: a failed git show would otherwise silently leave
-              # an empty database in place with no error shown.
-              if git show "FETCH_HEAD:$f" > "$f.tmp" 2>/dev/null && [ -s "$f.tmp" ]; then
-                mv "$f.tmp" "$f"
-                echo "restored $f"
-              else
-                rm -f "$f.tmp"
-                echo "WARNING: could not restore $f from trading-state - starting fresh for this file"
-              fi
-            done
-          else
-            echo "No prior state."
-          fi
+          python state_sync.py restore
 
       - name: Inject Telegram secrets
         run: |
@@ -115,32 +102,14 @@ jobs:
 
       - name: Save state
         if: always()
+        env:
+          STATE_REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
         run: |
           cd backtest-machine
-          tmp="$(mktemp -d)"
-          # This job only owns market_memory.db. Re-fetch the trader's DBs
-          # fresh right before pushing so a concurrent trading run (own
-          # concurrency group now) never gets clobbered by this job's
-          # possibly-stale restored snapshot of files it doesn't touch.
-          if git fetch origin trading-state --depth 1 2>/dev/null; then
-            for f in intraday_trades.db simple_trades.db options_trades.db; do
-              git show "FETCH_HEAD:$f" > "$tmp/$f" 2>/dev/null || true
-            done
-          fi
-          if [ -f market_memory.db ]; then
-            cp market_memory.db "$tmp/"
-          fi
-          [ -n "$(ls -A "$tmp")" ] || { echo "Nothing to save."; exit 0; }
-          cd "$tmp"
-          git init -q
-          git checkout -q -b trading-state
-          git add -A
-          git -c user.name="intraday-ci" \
-              -c user.email="ci@users.noreply.github.com" \
-              commit -q -m "state $(date -u +%FT%TZ)"
-          git push -f \
-            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
-            trading-state
+          # Owns ONLY market_memory.db. The three trading books belong to
+          # the trading workflow and are left untouched - this is what
+          # stops the two workflows overwriting each other's state.
+          python state_sync.py save --own market_memory.db
 
       - name: Publish dashboard (GitHub Pages)
         if: always()
