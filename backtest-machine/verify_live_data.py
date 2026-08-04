@@ -101,8 +101,13 @@ def main():
     print(f"  High           : Rs.{q['high']:,.2f}")
     print(f"  Low            : Rs.{q['low']:,.2f}")
     print(f"  Prev close     : Rs.{q['close']:,.2f}")
-    print(f"  Volume         : {q['volume']:,}")
-    print(f"  Open interest  : {q['oi']:,}")
+    # Angel One reports volume/OI in SHARES; broker apps almost always
+    # display them in LOTS. Show both so the two can be compared without
+    # the reader having to know the convention.
+    lot = rec["lotsize"]
+    print(f"  Volume         : {q['volume']:,} qty   = {q['volume']//lot:,} lots")
+    print(f"  Open interest  : {q['oi']:,} qty   = {q['oi']//lot:,} lots")
+    print(f"  (lot size {lot} - your broker app most likely shows the LOTS figure)")
 
     one_lot = q["ask"] * rec["lotsize"] if q["ask"] else q["ltp"] * rec["lotsize"]
     print(f"\n  1 lot at ask   : Rs.{one_lot:,.0f} "
@@ -119,16 +124,18 @@ def main():
 
     telegram(
         f"✅ LIVE DATA VERIFIED | {rec['symbol']}\n"
-        f"Token: {rec['token']}  Lot: {rec['lotsize']}\n"
+        f"Token: {rec['token']}  Lot: {lot}\n"
         f"Expiry: {rec['expiry']}\n\n"
         f"LTP: Rs.{q['ltp']:,.2f}\n"
         f"Bid: Rs.{q['bid']:,.2f}   Ask: Rs.{q['ask']:,.2f}\n"
         f"Open: Rs.{q['open']:,.2f}  High: Rs.{q['high']:,.2f}  "
         f"Low: Rs.{q['low']:,.2f}\n"
-        f"Volume: {q['volume']:,}\n"
-        f"OI: {q['oi']:,}\n\n"
-        f"1 lot at ask = Rs.{one_lot:,.0f}\n"
-        f"Compare these against your broker app.")
+        f"Volume: {q['volume']//lot:,} lots ({q['volume']:,} qty)\n"
+        f"OI: {q['oi']//lot:,} lots ({q['oi']:,} qty)\n\n"
+        f"1 lot at ask = Rs.{one_lot:,.0f}\n\n"
+        f"NOTE: broker apps usually show volume/OI in LOTS.\n"
+        f"Prices are last-traded - outside market hours they are the\n"
+        f"previous session's close, not a live tick.")
     return 0
 
 
