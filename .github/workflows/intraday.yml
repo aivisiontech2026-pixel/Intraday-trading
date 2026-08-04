@@ -41,6 +41,22 @@ jobs:
       - name: Install dependencies
         run: pip install -r backtest-machine/requirements.txt
 
+      # The instrument master is ~35 MB and Angel One refreshes it daily.
+      # angelone_client caches it on disk, but GitHub runners are
+      # EPHEMERAL - that cache never survived a run, so every single cycle
+      # re-downloaded 35 MB (~2.6 GB/day at 5-min polling, ~13 GB/day at
+      # 1-min). Keyed by date so it still refreshes once every day.
+      - name: Instrument master cache key (today's date, IST)
+        id: imkey
+        run: echo "day=$(date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache instrument master
+        uses: actions/cache@v4
+        with:
+          path: backtest-machine/scripmaster_cache.json
+          key: scripmaster-${{ steps.imkey.outputs.day }}
+          restore-keys: scripmaster-
+
       - name: Restore trading state
         env:
           STATE_REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git

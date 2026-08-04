@@ -85,6 +85,20 @@ MAX_POSITIONS = 4           # 4 x Rs.25,000 = the full Rs.100,000 book
 FALLBACK_START_MIN = 11 * 60
 T_ENTRY_START, T_ENTRY_END = 9 * 60 + 30, 14 * 60 + 30
 
+# How stale the UNDERLYING signal may be before it is refetched.
+#
+# The signal (EMA9/21 + VWAP) is computed on 5-MINUTE bars, so it cannot
+# change more often than a new bar closes. Refetching 20 symbols from
+# yfinance every minute would therefore recompute an identical answer
+# ~4 times out of 5 while quintupling the request rate - and yfinance
+# already rate-limits us at the current cadence (all 18 pre-market
+# symbols failed on 2026-08-04).
+#
+# So: signals refresh on the bar cadence, while option QUOTES are pulled
+# every cycle. That is what makes sub-5-minute polling worthwhile - the
+# gain is faster stop-loss reaction, not fresher signals.
+SIGNAL_MAX_AGE_SEC = 285    # just under 5 min, so a 5-min bar is never missed
+
 UNIVERSE = [("NIFTY", "^NSEI"), ("BANKNIFTY", "^NSEBANK")] + \
     [(s.replace(".NS", ""), s) for s in CFG.get("symbols", [])]
 UNIVERSE_NAMES = [n for n, _ in UNIVERSE]
@@ -398,6 +412,37 @@ def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None)
 
 
 # ----------------------------------------------------------------- engine ---
+def load_cached_signals(conn, now):
+    """Underlying signals from the last refresh, if still within the bar
+    cadence. Returns (data, age_seconds) or (None, age_or_None).
+
+    Timestamps are stored and compared as NAIVE local time. process()
+    passes an AWARE `now` (datetime.now().astimezone()), so it is
+    normalised here - mixing the two raises TypeError, which was
+    previously swallowed and made the cache silently never hit.
+    """
+    raw = meta_get(conn, "signal_cache")
+    if not raw:
+        return None, None
+    try:
+        blob = json.loads(raw)
+        naive_now = now.replace(tzinfo=None)
+        age = (naive_now - datetime.fromisoformat(blob["ts"])).total_seconds()
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"  Signals: cache unreadable ({type(e).__name__}) - refetching")
+        return None, None
+    if age < 0 or age > SIGNAL_MAX_AGE_SEC:
+        return None, age
+    return blob["data"], age
+
+
+def save_cached_signals(conn, data, now):
+    """Persist signals with a NAIVE timestamp - see load_cached_signals."""
+    meta_set(conn, "signal_cache",
+             json.dumps({"ts": now.replace(tzinfo=None).isoformat(),
+                         "data": data}))
+
+
 def square_off_net(conn, log, now_min, degraded_reason):
     """Unconditional 15:15 square-off, usable in DEGRADED mode.
 
@@ -464,22 +509,31 @@ def process(conn, log, today):
         conn.commit()
         return
 
-    # ---- underlying signals (yfinance 5-min bars) ----------------------
-    data = {}
-    for name, ticker in UNIVERSE:
-        try:
-            df = yf.download(ticker, period="5d", interval=INTERVAL,
-                             auto_adjust=True, progress=False,
-                             multi_level_index=False)
-        except Exception as e:
-            print(f"  {name}: underlying download failed ({e})")
-            continue
-        if df is None or df.empty:
-            continue
-        data[name] = {"spot": float(df["Close"].iloc[-1]),
-                      "direction": get_direction(df),
-                      "momentum": get_momentum(df, today),
-                      "trend_quality": get_trend_quality(df)}
+    # ---- underlying signals (yfinance 5-min bars, refreshed on the bar
+    # cadence rather than every cycle - see SIGNAL_MAX_AGE_SEC) ----------
+    data, age = load_cached_signals(conn, now)
+    signals_fresh = data is None
+    if data is not None:
+        print(f"  Signals: reusing cache ({age:.0f}s old, 5-min bar unchanged)"
+              f" - {len(data)} symbols, no yfinance calls this cycle")
+    else:
+        data = {}
+        for name, ticker in UNIVERSE:
+            try:
+                df = yf.download(ticker, period="5d", interval=INTERVAL,
+                                 auto_adjust=True, progress=False,
+                                 multi_level_index=False)
+            except Exception as e:
+                print(f"  {name}: underlying download failed ({e})")
+                continue
+            if df is None or df.empty:
+                continue
+            data[name] = {"spot": float(df["Close"].iloc[-1]),
+                          "direction": get_direction(df),
+                          "momentum": get_momentum(df, today),
+                          "trend_quality": get_trend_quality(df)}
+        if data:
+            print(f"  Signals: refreshed {len(data)} symbols from yfinance")
     if "NIFTY" not in data:
         print("  No underlying data -> no NEW option trades this cycle.")
         square_off_net(conn, log, now_min, "no underlying data")
@@ -491,13 +545,19 @@ def process(conn, log, today):
     nifty_mom = data["NIFTY"]["momentum"]
     for name, info in data.items():
         info["rel_strength"] = round(info["momentum"] - nifty_mom, 3)
+    if signals_fresh:
+        save_cached_signals(conn, data, now)
 
     positions = load_positions(conn)
 
     # ---- decide which contracts we may enter, so quotes can be batched --
     traded_today = symbols_traded_today(conn, today_str)
     open_count = len(positions)
-    in_window = T_ENTRY_START <= now_min <= T_ENTRY_END
+    # Entries require FRESH signals. On a cached-signal cycle the bot is
+    # here purely to mark positions and enforce stops against live option
+    # quotes - opening a new position off a signal it already acted on
+    # would just re-trade the same bar.
+    in_window = (T_ENTRY_START <= now_min <= T_ENTRY_END) and signals_fresh
 
     candidates = []   # dicts: name/rec/direction/tier/tag + score features
     if in_window:
