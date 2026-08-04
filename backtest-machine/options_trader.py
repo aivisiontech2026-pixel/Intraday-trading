@@ -362,7 +362,7 @@ def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None)
         "entry_price,exit_price,entry_time,exit_time,pnl,reason,token,"
         "trading_symbol,lots,lotsize,exit_bid,exit_ask,exit_oi,price_source,"
         "entry_bid,entry_ask,entry_oi,entry_volume,entry_score,entry_rank,"
-        "entry_tier) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "entry_tier) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (pos["symbol"], pos["option_type"], pos["strike"], pos["expiry"], qty,
          pos["entry_price"], exit_px, pos["entry_time"],
          datetime.now().isoformat(), pnl, reason, pos.get("token"),
@@ -398,6 +398,38 @@ def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None)
 
 
 # ----------------------------------------------------------------- engine ---
+def square_off_net(conn, log, now_min, degraded_reason):
+    """Unconditional 15:15 square-off, usable in DEGRADED mode.
+
+    The strategy's core guarantee is that no position is ever carried
+    overnight. That guarantee must not depend on Angel One being
+    reachable, on the instrument master downloading, or on yfinance
+    returning bars - all of which are external services that can fail.
+
+    Uses the LAST OBSERVED LIVE price stored on the position each cycle
+    (falling back to the entry price if the position never got a mark).
+    That is a real, previously-observed market price - stale, and
+    labelled as such - never a model price.
+
+    No-op before 15:15: during the session a position with no quote is
+    correctly held and retried, not force-closed on a data hiccup.
+    """
+    if now_min < T_SQUARE_OFF:
+        return
+    stranded = load_positions(conn)
+    if not stranded:
+        return
+    print(f"  SQUARE-OFF NET: {len(stranded)} position(s) still open past "
+          f"15:15 while degraded ({degraded_reason}) - closing at last "
+          f"observed price rather than carrying overnight.")
+    for pos in stranded:
+        px = pos.get("last_price") or pos.get("entry_price")
+        close_option(conn, pos, px,
+                     f"Square-off 15:15 (degraded: {degraded_reason} - "
+                     f"last observed price)", log, None,
+                     price_source="LAST_OBSERVED_LIVE")
+
+
 def process(conn, log, today):
     today_str = today.isoformat()
 
@@ -412,15 +444,24 @@ def process(conn, log, today):
     now_min = now.hour * 60 + now.minute
 
     # ---- live market data plumbing -------------------------------------
+    # NOTE: every early return below MUST first run the square-off net.
+    # On 2026-08-04 four positions were carried overnight because a
+    # degraded-data return skipped position management entirely - which
+    # silently broke the strategy's core promise that nothing is ever
+    # held past 15:15.
     smart = angel.login()
     if smart is None:
-        print("  Angel One unavailable -> NO option trading this cycle "
+        print("  Angel One unavailable -> no NEW option trades this cycle "
               "(execution requires live quotes; synthetic pricing is not "
-              "permitted). Open positions are held.")
+              "permitted).")
+        square_off_net(conn, log, now_min, "Angel One unavailable")
+        conn.commit()
         return
     master = angel.load_instrument_master(UNIVERSE_NAMES)
     if not master:
-        print("  Instrument master unavailable -> NO option trading this cycle.")
+        print("  Instrument master unavailable -> no NEW option trades.")
+        square_off_net(conn, log, now_min, "instrument master unavailable")
+        conn.commit()
         return
 
     # ---- underlying signals (yfinance 5-min bars) ----------------------
@@ -440,7 +481,9 @@ def process(conn, log, today):
                       "momentum": get_momentum(df, today),
                       "trend_quality": get_trend_quality(df)}
     if "NIFTY" not in data:
-        print("  No underlying data -> skipping cycle.")
+        print("  No underlying data -> no NEW option trades this cycle.")
+        square_off_net(conn, log, now_min, "no underlying data")
+        conn.commit()
         return
 
     # relative strength: today's move vs NIFTY's (evidence: the strongest
@@ -642,10 +685,59 @@ def process(conn, log, today):
 
 
 # ----------------------------------------------------------------- main ---
+def selfcheck(conn):
+    """Fail LOUD on a broken write path, before any trading happens.
+
+    A 26-column / 25-placeholder mismatch in close_option()'s INSERT
+    shipped undetected and crashed EVERY option close - positions were
+    opened and then carried overnight because the exit threw. The
+    workflow pipes stdout through `tee`, which discards the exit code,
+    so the step still reported success. Exercising the write path here
+    against a throwaway transaction turns that class of failure into an
+    immediate, visible error.
+    """
+    probe = {"id": -1, "symbol": "_SELFCHECK", "option_type": "CE",
+             "strike": 0.0, "expiry": date.today().isoformat(), "qty": 1,
+             "entry_price": 1.0, "entry_time": "1970-01-01T00:00:00",
+             "high_water": 1.0, "stop_price": 1.0, "token": "0",
+             "trading_symbol": "_SELFCHECK", "lots": 1, "lotsize": 1,
+             "last_price": 1.0, "entry_fair_value": None,
+             "entry_bid": None, "entry_ask": None, "entry_oi": None,
+             "entry_volume": None, "entry_score": None,
+             "entry_rank": None, "entry_tier": None}
+    global trace
+    real_trace, trace = trace, lambda **kw: None   # keep the probe silent
+    try:
+        conn.execute("SAVEPOINT selfcheck")
+        conn.execute(
+            "INSERT INTO options_positions(id,symbol,option_type,strike,"
+            "expiry,qty,entry_price,entry_time,high_water,stop_price,token,"
+            "trading_symbol,lots,lotsize,last_price) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (probe["id"], probe["symbol"], probe["option_type"],
+             probe["strike"], probe["expiry"], probe["qty"],
+             probe["entry_price"], probe["entry_time"], probe["high_water"],
+             probe["stop_price"], probe["token"], probe["trading_symbol"],
+             probe["lots"], probe["lotsize"], probe["last_price"]))
+        close_option(conn, probe, 1.0, "selfcheck", [], None,
+                     price_source="SELFCHECK")
+    except Exception as e:
+        print(f"  FATAL: trade write path is broken - {type(e).__name__}: {e}")
+        print("  Refusing to trade. Fix the schema/SQL before running again.")
+        raise
+    finally:
+        trace = real_trace
+        conn.execute("ROLLBACK TO selfcheck")
+        conn.execute("RELEASE selfcheck")
+    return True
+
+
 def main():
     conn = db_init()
     today = date.today()
     log = []
+
+    selfcheck(conn)   # aborts loudly if open/close SQL is broken
 
     positions = load_positions(conn)
     if not positions:

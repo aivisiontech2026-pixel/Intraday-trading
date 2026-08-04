@@ -71,6 +71,11 @@ jobs:
           ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
           ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
         run: |
+          # pipefail is essential: `python x.py | tee` otherwise reports
+          # tee's exit code, so a CRASHING trader still shows a green
+          # step. That is exactly how a broken close_option() ran
+          # undetected on 2026-08-04 and stranded positions overnight.
+          set -o pipefail
           cd backtest-machine
           echo "=== SIMPLE STOCKS ===" | tee run_output.txt
           python simple_trader.py | tee -a run_output.txt

@@ -179,24 +179,36 @@ def fetch_news():
 
 
 def stock_candidates():
-    """Momentum ranking of the trading universe -> call/put candidates."""
-    mom = []
+    """Momentum ranking of the trading universe -> call/put candidates.
+
+    Returns (calls, puts, failed_count). The failure count matters: on
+    2026-08-04 every symbol's download failed (Yahoo rate-limits ~18
+    sequential requests from a cloud IP) and the report printed two blank
+    lines with no explanation. An empty result must say WHY it is empty.
+    """
+    mom, failed = [], 0
     for sym in STOCKS:
         try:
             df = yf.download(sym, period="10d", interval="1d",
                              auto_adjust=True, progress=False,
                              multi_level_index=False)
             if df is None or len(df) < 6:
+                failed += 1
                 continue
             last, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-6])
             if last != last or prev != prev or prev == 0:  # NaN / zero guard
+                failed += 1
                 continue
             r5 = (last / prev - 1) * 100
             mom.append((sym.replace(".NS", ""), round(r5, 2)))
         except Exception:
+            failed += 1
             continue
+    if failed:
+        print(f"  stock_candidates: {failed}/{len(STOCKS)} symbols "
+              f"unavailable (likely Yahoo rate-limiting)")
     mom.sort(key=lambda x: -x[1])
-    return mom[:3], mom[-3:]
+    return mom[:3], mom[-3:], failed
 
 
 # ------------------------------------------------------------------ engine ---
@@ -304,7 +316,7 @@ def main():
     ind = fetch_india()
     sentiment, headlines = fetch_news()
     pcr, max_pain = fetch_option_chain()
-    calls, puts = stock_candidates()
+    calls, puts, cand_failed = stock_candidates()
 
     # gap estimate proxy: weighted overnight cues (SGX/GIFT not on free feeds)
     cues = [(g.get("sp500_chg"), 0.5), (g.get("asia_chg"), 0.35),
@@ -367,8 +379,12 @@ def main():
         f">>> {decision} | Confidence {confidence}% | Risk: {risk}",
         *trade_lines,
         "",
-        "CALL candidates: " + ", ".join(f"{s}({r:+.1f}%)" for s, r in calls),
-        "PUT candidates: " + ", ".join(f"{s}({r:+.1f}%)" for s, r in puts),
+        ("CALL candidates: " + (", ".join(f"{s}({r:+.1f}%)" for s, r in calls)
+                                if calls else f"unavailable ({cand_failed} symbols "
+                                              f"failed to download)")),
+        ("PUT candidates: " + (", ".join(f"{s}({r:+.1f}%)" for s, r in puts)
+                               if puts else f"unavailable ({cand_failed} symbols "
+                                            f"failed to download)")),
     ]
     report = "\n".join(lines)
     print(report)
