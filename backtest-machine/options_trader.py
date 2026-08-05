@@ -44,6 +44,11 @@ Strategy (trend-following, no fixed profit target)
   - Bullish -> buy ATM call; bearish -> buy ATM put
   - Initial stop: -15% of entry premium
   - Once +10%, a trailing stop ratchets 12% below the high-water premium
+  - The high-water mark includes peaks that occur BETWEEN polls, taken
+    from the session high in each quote, so a spike that fades before the
+    next cycle still ratchets the stop (a resting stop order would have
+    caught it). Symmetrically, a session low through the stop triggers the
+    exit. Baselined at entry so pre-entry extremes are excluded.
   - Trend reversal on the underlying exits immediately
   - Everything is squared off at 15:15
 
@@ -165,6 +170,12 @@ def db_init():
         ("options_trades", "entry_score", "REAL"),
         ("options_trades", "entry_rank", "INTEGER"),
         ("options_trades", "entry_tier", "TEXT"),
+        # intra-interval extremes: the day's high/low as last observed, so a
+        # peak or trough BETWEEN two polls is not lost - see process()
+        ("options_positions", "day_high_seen", "REAL"),
+        ("options_positions", "day_low_seen", "REAL"),
+        ("options_positions", "peak_source", "TEXT"),
+        ("options_trades", "peak_source", "TEXT"),
     ]:
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         if col not in cols:
@@ -189,7 +200,8 @@ POS_COLS = ["id", "symbol", "option_type", "strike", "expiry", "qty",
             "entry_price", "entry_time", "high_water", "stop_price",
             "token", "trading_symbol", "lots", "lotsize", "last_price",
             "entry_fair_value", "entry_bid", "entry_ask", "entry_oi",
-            "entry_volume", "entry_score", "entry_rank", "entry_tier"]
+            "entry_volume", "entry_score", "entry_rank", "entry_tier",
+            "day_high_seen", "day_low_seen", "peak_source"]
 POS_SELECT = "SELECT " + ",".join(POS_COLS) + " FROM options_positions"
 
 
@@ -324,17 +336,23 @@ def open_option(conn, rec, quote, spot, underlying_dir, today, log,
     cost = qty * entry_px
     initial_stop = round(entry_px * (1 + INITIAL_STOP_PCT), 2)
 
+    # Baseline the session extremes AT ENTRY. The day's high/low are
+    # cumulative from 09:15, so they may already contain a spike that
+    # happened before we bought. Only a LATER rise above this baseline can
+    # have occurred while we held the position - see process().
     conn.execute(
         "INSERT INTO options_positions(symbol,option_type,strike,expiry,qty,"
         "entry_price,entry_time,high_water,stop_price,token,trading_symbol,"
         "lots,lotsize,last_price,entry_fair_value,entry_bid,entry_ask,"
-        "entry_oi,entry_volume,entry_score,entry_rank,entry_tier) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "entry_oi,entry_volume,entry_score,entry_rank,entry_tier,"
+        "day_high_seen,day_low_seen) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (rec["name"], rec["opt_type"], rec["strike"], rec["expiry"].isoformat(),
          qty, entry_px, datetime.now().isoformat(), entry_px, initial_stop,
          rec["token"], rec["symbol"], lots, lotsize, entry_px, fair,
          bid, ask, quote.get("oi"), quote.get("volume"),
-         score, rank_pos, tier))
+         score, rank_pos, tier,
+         quote.get("high") or entry_px, quote.get("low") or entry_px))
     meta_set(conn, "cash", cash(conn) - cost)
 
     edge = f"{entry_px - fair:+.2f}" if fair else "n/a"
@@ -357,12 +375,18 @@ def open_option(conn, rec, quote, spot, underlying_dir, today, log,
     return True
 
 
-def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None):
+def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None,
+                 peak_source=None):
     """Close a position.
 
     `exit_px` is normally the live market price. For stop-triggered exits
     the caller passes the STOP LEVEL instead and sets
     price_source="STOP_LEVEL" - see the stop branch in process() for why.
+
+    `peak_source` records whether the high-water mark that set the trailing
+    stop came from a polled price (POLL) or from the session high observed
+    between polls (INTRA_INTERVAL_HIGH), so the two can be compared in
+    attribution.
     """
     qty = pos["qty"]
     proceeds = qty * exit_px
@@ -376,7 +400,8 @@ def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None)
         "entry_price,exit_price,entry_time,exit_time,pnl,reason,token,"
         "trading_symbol,lots,lotsize,exit_bid,exit_ask,exit_oi,price_source,"
         "entry_bid,entry_ask,entry_oi,entry_volume,entry_score,entry_rank,"
-        "entry_tier) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "entry_tier,peak_source) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (pos["symbol"], pos["option_type"], pos["strike"], pos["expiry"], qty,
          pos["entry_price"], exit_px, pos["entry_time"],
          datetime.now().isoformat(), pnl, reason, pos.get("token"),
@@ -386,7 +411,7 @@ def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None)
          quote.get("oi") if quote else None, src,
          pos.get("entry_bid"), pos.get("entry_ask"), pos.get("entry_oi"),
          pos.get("entry_volume"), pos.get("entry_score"),
-         pos.get("entry_rank"), pos.get("entry_tier")))
+         pos.get("entry_rank"), pos.get("entry_tier"), peak_source))
     conn.execute("DELETE FROM options_positions WHERE id=?", (pos["id"],))
     meta_set(conn, "cash", cash(conn) + proceeds)
 
@@ -400,7 +425,8 @@ def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None)
           fill=f"{exit_px:.2f}", entry=f"{pos['entry_price']:.2f}",
           market=f"{quote['bid'] or quote['ltp']:.2f}" if quote else "n/a",
           qty=qty, pnl=f"{pnl:.0f}", pnl_pct=f"{pnl_pct:+.1f}%",
-          reason=reason, price_source=src)
+          reason=reason, price_source=src, peak_source=peak_source or "n/a",
+          high_water=f"{pos.get('high_water') or pos['entry_price']:.2f}")
 
     emoji = "✅" if pnl > 0 else "❌"
     msg = (f"{emoji} OPTIONS: SOLD {pos.get('lots')} lot(s) ({qty}) "
@@ -649,20 +675,69 @@ def process(conn, log, today):
         # exit fills at the live BID (crossing the spread), else live LTP
         mark = q["bid"] if q["bid"] > 0 else q["ltp"]
 
+        # ---- INTRA-INTERVAL PEAK CAPTURE ---------------------------------
+        # The bot only sees prices at poll instants. A premium that spikes
+        # and fades between two polls was invisible, so the high-water mark
+        # - and therefore the trailing stop - was built from a SAMPLED
+        # series while a real broker's stop watches every tick.
+        #
+        # This cost a real trade: NIFTY11AUG2624600CE on 2026-08-05 traded
+        # to ~193 but the bot's sampled peak was 183.25, putting the trail
+        # at 161.26 (BELOW the 164.80 entry) instead of 169.84 (above it).
+        # A +Rs.655 winner was booked as a -Rs.460 loss. The evidence was
+        # already in the quote: Angel One returns the session high/low on
+        # every call, and this code discarded them.
+        #
+        # The day's high is cumulative from 09:15, so it can contain a spike
+        # that predates our entry - ratcheting off it directly would invent
+        # profit we never had. Only a rise ABOVE the value seen on the
+        # previous poll can have happened during the interval just elapsed,
+        # i.e. while we held. That delta is what we ratchet on.
+        #
+        # This mirrors a resting trailing-stop order: if the premium ran
+        # 183 -> 193 -> 161 inside one interval, a real stop would have
+        # ratcheted to 169.84 on the way up and filled there on the way
+        # down. Same answer. Consistent with the STOP_LEVEL fill contract.
+        day_high, day_low = q.get("high") or 0.0, q.get("low") or 0.0
+        prev_high = pos.get("day_high_seen") or day_high
+        prev_low = pos.get("day_low_seen") or day_low
+
+        # peak_source is STICKY: it records how the high-water mark that set
+        # the current stop was obtained, so it must persist on the position.
+        # Recomputing it at exit would report the last cycle's source, not
+        # the cycle that actually captured the peak.
         high_water = max(pos["high_water"] or pos["entry_price"], mark)
+        peak_source = pos.get("peak_source") or "POLL"
+        if day_high > prev_high and day_high > high_water:
+            high_water = day_high
+            peak_source = "INTRA_INTERVAL_HIGH"
+
         stop_price = pos["stop_price"] or pos["entry_price"] * (1 + INITIAL_STOP_PCT)
         if high_water >= pos["entry_price"] * (1 + TRAIL_ACTIVATE_PCT):
             stop_price = max(stop_price, high_water * (1 - TRAIL_PCT))
+
+        # A new session LOW below the stop means the premium traded through
+        # the stop between polls - a resting order would already have
+        # filled. Evaluate the exit against that trough, not just the
+        # wake-up price, so a spike-down through the stop is not missed.
+        trough = day_low if (day_low > 0 and day_low < prev_low) else mark
+        trigger = min(mark, trough)
+
         conn.execute("UPDATE options_positions SET high_water=?, stop_price=?, "
-                     "last_price=? WHERE id=?",
-                     (high_water, stop_price, mark, pos["id"]))
+                     "last_price=?, day_high_seen=?, day_low_seen=?, "
+                     "peak_source=? WHERE id=?",
+                     (high_water, stop_price, mark,
+                      max(day_high, prev_high), min(day_low, prev_low) if day_low
+                      else prev_low, peak_source, pos["id"]))
         pos["high_water"], pos["stop_price"] = high_water, stop_price
 
         trace(event="mark", ts=datetime.now().isoformat(timespec="seconds"),
               symbol=pos.get("trading_symbol"), token=token,
               ltp=f"{q['ltp']:.2f}", bid=f"{q['bid']:.2f}", ask=f"{q['ask']:.2f}",
+              day_high=f"{day_high:.2f}", day_low=f"{day_low:.2f}",
               volume=q["volume"], oi=q["oi"], mark=f"{mark:.2f}",
               entry=f"{pos['entry_price']:.2f}", high_water=f"{high_water:.2f}",
+              peak_source=peak_source, trigger=f"{trigger:.2f}",
               stop=f"{stop_price:.2f}",
               unrealised=f"{(mark - pos['entry_price']) * pos['qty']:.0f}")
 
@@ -670,7 +745,7 @@ def process(conn, log, today):
                      (pos["option_type"] == "PE" and direction == "BULL"))
         expiry = datetime.strptime(pos["expiry"], "%Y-%m-%d").date()
 
-        if mark <= stop_price:
+        if trigger <= stop_price:
             # STOP-PRICE FILL: book the exit AT the stop level, not at the
             # price we happen to observe on waking. A resting stop order
             # sitting with the broker triggers the instant price touches
@@ -688,16 +763,24 @@ def process(conn, log, today):
             # Assumes an ideal fill at the level. If the premium genuinely
             # gapped through the stop with no trades in between, a real
             # order would have filled worse than this.
-            trailing = high_water > pos["entry_price"] * (1 + TRAIL_ACTIVATE_PCT)
+            # >= matches the activation test above. With > , a peak landing
+            # exactly on the activation threshold trailed the stop but was
+            # still recorded as "Initial stop", mislabelling the exit in
+            # every attribution report.
+            trailing = high_water >= pos["entry_price"] * (1 + TRAIL_ACTIVATE_PCT)
             close_option(conn, pos, stop_price,
                          "Trailing stop" if trailing else "Initial stop",
-                         log, q, price_source="STOP_LEVEL")
+                         log, q, price_source="STOP_LEVEL",
+                         peak_source=peak_source)
         elif reversed_:
-            close_option(conn, pos, mark, "Trend reversal exit", log, q)
+            close_option(conn, pos, mark, "Trend reversal exit", log, q,
+                         peak_source=peak_source)
         elif expiry < today:
-            close_option(conn, pos, mark, "Expired contract", log, q)
+            close_option(conn, pos, mark, "Expired contract", log, q,
+                         peak_source=peak_source)
         elif now_min >= T_SQUARE_OFF:
-            close_option(conn, pos, mark, "Square-off 15:15", log, q)
+            close_option(conn, pos, mark, "Square-off 15:15", log, q,
+                         peak_source=peak_source)
 
     if not in_window:
         conn.commit()
