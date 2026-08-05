@@ -848,8 +848,14 @@ def selfcheck(conn):
              "entry_bid": None, "entry_ask": None, "entry_oi": None,
              "entry_volume": None, "entry_score": None,
              "entry_rank": None, "entry_tier": None}
-    global trace
-    real_trace, trace = trace, lambda **kw: None   # keep the probe silent
+    # Silence BOTH sinks. close_option() sends a Telegram alert on every
+    # exit, and the probe drives close_option() - so the check was pushing
+    # a fake "SOLD _SELFCHECK" message to the phone on every single cycle.
+    # The trade itself was always correctly rolled back; only the
+    # notification escaped, because the rollback cannot recall it.
+    global trace, telegram
+    real_trace, trace = trace, lambda **kw: None
+    real_tg, telegram = telegram, lambda msg: None
     try:
         conn.execute("SAVEPOINT selfcheck")
         conn.execute(
@@ -869,7 +875,7 @@ def selfcheck(conn):
         print("  Refusing to trade. Fix the schema/SQL before running again.")
         raise
     finally:
-        trace = real_trace
+        trace, telegram = real_trace, real_tg
         conn.execute("ROLLBACK TO selfcheck")
         conn.execute("RELEASE selfcheck")
     return True

@@ -271,6 +271,41 @@ def test_write_path_intact():
     os.remove(db)
 
 
+def test_selfcheck_is_silent():
+    """The probe must leave no trace: no rows, no Telegram alert.
+
+    selfcheck() drives close_option(), which alerts on every exit - so the
+    probe was pushing a fake "SOLD _SELFCHECK" message on every cycle. The
+    savepoint rolls the ROW back but cannot recall a sent notification.
+    """
+    print("\n[9] selfcheck leaves no trace")
+    db = "t_silent.db"
+    seed(db, 100.00)
+    ot.DB = db
+    conn = ot.db_init()
+
+    sent = []
+    real_tg = ot.telegram
+    ot.telegram = lambda msg: sent.append(msg)
+    try:
+        ot.selfcheck(conn)
+    finally:
+        ot.telegram = real_tg
+
+    rows = conn.execute("SELECT COUNT(*) FROM options_trades "
+                        "WHERE trading_symbol='_SELFCHECK'").fetchone()[0]
+    pos = conn.execute("SELECT COUNT(*) FROM options_positions "
+                       "WHERE trading_symbol='_SELFCHECK'").fetchone()[0]
+    cash_after = ot.cash(conn)
+    conn.close()
+    check("no Telegram alert sent", sent, [])
+    check("no trade row persisted", rows, 0)
+    check("no position row persisted", pos, 0)
+    check("cash untouched", cash_after, 100000.0)
+    check("telegram restored afterwards", ot.telegram is real_tg, True)
+    os.remove(db)
+
+
 if __name__ == "__main__":
     for fn in (test_intra_interval_peak_ratchets_the_stop,
                test_pre_entry_high_is_excluded,
@@ -279,7 +314,8 @@ if __name__ == "__main__":
                test_ratchet_is_monotonic,
                test_winner_survives_to_square_off,
                test_no_overnight_carry_when_degraded,
-               test_write_path_intact):
+               test_write_path_intact,
+               test_selfcheck_is_silent):
         fn()
     print("\n" + "=" * 60)
     if FAILURES:
