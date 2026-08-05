@@ -30,6 +30,22 @@ BOOKS = [  # (label, db file, trades table, positions table, pnl col config)
 ]
 CAPITAL = 100_000
 
+# REAL PRICES ONLY.
+#
+# Before the Angel One live-quote pipeline existed, option exits were
+# valued with Black-Scholes. Those 34 trades booked a fictional +Rs.46,479
+# that no market ever paid, and leaving them in made every headline number
+# on this page meaningless.
+#
+# `price_source` is stamped on every trade priced from live market data
+# (LIVE_ASK / LIVE_BID / LIVE_LTP / STOP_LEVEL / LAST_OBSERVED_LIVE) and is
+# NULL on the model-priced ones - so it is an exact marker for the split.
+# The dashboard now reports the live era only.
+#
+# The stock books need no such filter: they always traded on real Yahoo
+# quotes for real listed shares.
+REAL_ONLY = "price_source IS NOT NULL"
+
 
 def q(dbfile, sql, args=()):
     p = HERE / dbfile
@@ -44,6 +60,15 @@ def q(dbfile, sql, args=()):
         return []
 
 
+def has_column(dbfile, table, col):
+    """True if `col` exists. Guards the REAL_ONLY filter: on a database
+    predating the column, q() would swallow the OperationalError and return
+    [], silently blanking the entire book rather than showing it unfiltered.
+    """
+    return any(r[1] == col for r in
+               q(dbfile, f"PRAGMA table_info({table})"))
+
+
 def esc(s):
     return html.escape(str(s))
 
@@ -55,15 +80,23 @@ def collect():
     books = []          # per-book summary
     positions = []      # (book, label, qty, entry)
 
+    excluded = 0        # model-priced trades hidden from every figure below
+
     for label, dbfile, ttable, ptable in BOOKS:
         cash_row = q(dbfile, "SELECT value FROM meta WHERE key='cash'")
         cash = float(cash_row[0][0]) if cash_row else CAPITAL
 
         if label == "Options":
+            real = has_column(dbfile, ttable, "price_source")
+            where = f" WHERE {REAL_ONLY}" if real else ""
             rows = q(dbfile, f"SELECT exit_time, symbol || ' ' || option_type || ' ' "
-                             f"|| CAST(strike AS INT), pnl, reason FROM {ttable}")
+                             f"|| CAST(strike AS INT), pnl, reason FROM {ttable}{where}")
             pos = q(dbfile, f"SELECT symbol || ' ' || option_type || ' ' "
                             f"|| CAST(strike AS INT), qty, entry_price FROM {ptable}")
+            if real:
+                skipped = q(dbfile, f"SELECT COUNT(*) FROM {ttable} "
+                                    f"WHERE price_source IS NULL")
+                excluded += skipped[0][0] if skipped else 0
         else:
             exit_col = "exit_px" if label == "Stocks" else "exit"
             rows = q(dbfile, f"SELECT exit_time, symbol, pnl, reason FROM {ttable}")
@@ -78,6 +111,14 @@ def collect():
             d = (et or "")[:10]
             daily[d] = daily.get(d, 0.0) + pnl
             trades.append((et or "", label, sym, pnl, reason or ""))
+
+        # The stored cash balance still carries the excluded trades' fictional
+        # proceeds, so reporting it here would contradict the P&L beside it.
+        # Show the equity the REAL trades alone produced from the starting
+        # book instead.
+        if label == "Options" and excluded:
+            cash = CAPITAL + total
+
         books.append({"label": label, "cash": cash, "trades": len(rows),
                       "wins": wins, "pnl": total})
         for prow in pos:
@@ -93,7 +134,7 @@ def collect():
             "SELECT COUNT(*), COALESCE(SUM(call_correct),0) FROM daily_memory "
             "WHERE call_correct IS NOT NULL AND decision != 'NO TRADE'")
     n_calls, n_correct = (acc[0] if acc else (0, 0))
-    return daily, trades, books, positions, calls, n_calls, n_correct
+    return daily, trades, books, positions, calls, n_calls, n_correct, excluded
 
 
 # ------------------------------------------------------------------ charts ---
@@ -207,7 +248,8 @@ def cumulative_line_chart(daily):
 
 # ------------------------------------------------------------------ html ---
 def render():
-    daily, trades, books, positions, calls, n_calls, n_correct = collect()
+    (daily, trades, books, positions, calls, n_calls, n_correct,
+     excluded) = collect()
     today = date.today().isoformat()
     total_pnl = sum(b["pnl"] for b in books)
     today_pnl = daily.get(today, 0.0)
@@ -221,9 +263,18 @@ def render():
         arrow = "▲" if v >= 0 else "▼"
         return f'<span class="delta {cls}">{arrow} Rs.{abs(v):,.0f}</span>'
 
+    note = ""
+    if excluded:
+        note = (f'<div class="note">Showing <strong>live market prices only</strong>. '
+                f'{excluded} early option trade{"s" if excluded != 1 else ""} priced '
+                f'by the Black-Scholes model &mdash; before the Angel One quote feed '
+                f'existed &mdash; {"are" if excluded != 1 else "is"} excluded from every '
+                f'figure on this page, including the Options cash balance, which is '
+                f'shown as starting capital plus real P&amp;L.</div>')
+
     tiles = f"""
     <div class="tiles">
-      <div class="tile"><div class="k">All-time P&amp;L (paper)</div>
+      <div class="tile"><div class="k">All-time P&amp;L <span class="sub">(real prices)</span></div>
         <div class="v">Rs.{total_pnl:,.0f}</div>{delta(total_pnl)}</div>
       <div class="tile"><div class="k">Today's realized P&amp;L</div>
         <div class="v">Rs.{today_pnl:,.0f}</div>{delta(today_pnl)}</div>
@@ -305,6 +356,11 @@ h1 {{ font-size: 20px; }} h2 {{ font-size: 15px; color: var(--ink2); margin: 0 0
 .tile .k {{ font-size: 12.5px; color: var(--ink2); }}
 .tile .v {{ font-size: 26px; font-weight: 650; margin: 2px 0; }}
 .tile .sub {{ font-size: 14px; color: var(--muted); font-weight: 400; }}
+.tile .k .sub {{ font-size: 12.5px; }}
+.note {{ background: var(--surface); border: 1px solid var(--border);
+  border-left: 3px solid var(--neg); border-radius: 8px; padding: 10px 14px;
+  margin-bottom: 18px; font-size: 13px; color: var(--ink2); }}
+.note strong {{ color: var(--ink); }}
 .delta {{ font-size: 13px; }} .up {{ color: var(--up); }} .down {{ color: var(--down); }}
 svg {{ width: 100%; height: auto; display: block; }}
 .grid {{ stroke: var(--grid); stroke-width: 1; }}
@@ -329,6 +385,7 @@ th.num {{ text-align: right; }}
 <body><div class="wrap">
 <h1>Intraday Paper Trading</h1>
 <div class="stamp">Updated {stamp} &middot; paper mode &middot; Rs.{CAPITAL:,.0f} per book</div>
+{note}
 {tiles}
 <div class="card"><h2>Daily realized P&amp;L (last 30 days)</h2>{daily_bar_chart(daily)}</div>
 <div class="card"><h2>Cumulative P&amp;L</h2>{cumulative_line_chart(daily)}</div>
