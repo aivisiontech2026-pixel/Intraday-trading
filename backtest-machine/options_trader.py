@@ -90,6 +90,26 @@ MAX_POSITIONS = 4           # 4 x Rs.25,000 = the full Rs.100,000 book
 FALLBACK_START_MIN = 11 * 60
 T_ENTRY_START, T_ENTRY_END = 9 * 60 + 30, 14 * 60 + 30
 
+# EXPERIMENT (default OFF): same-cycle candidate-reuse guard.
+#
+# The candidate list is built once per cycle, BEFORE the position-
+# management loop runs. When an exit frees a slot mid-cycle, the entry
+# loop then refills it from that PRE-EXIT list. Measured over Aug 10-13:
+# 14 such same-cycle re-entries, 0 winners, -Rs.26,180.
+#
+# NOT a time-based cooldown: it does not delay by a fixed interval. It
+# ends the current entry evaluation so the next entry-eligible cycle
+# rebuilds candidates from freshly downloaded signals.
+#
+# Counter-evidence on record: in the profitable window the same mechanism
+# produced 2 winners from 3 attempts (+Rs.11,347), including the largest
+# trade in the book's history (SBIN +Rs.13,125 on 2026-08-06, entered one
+# second after a loss). This flag would have skipped that trade.
+#
+# Absent from config => False => behaviour byte-identical to baseline.
+EXPERIMENT_NO_SAME_CYCLE_REENTRY = bool(
+    CFG.get("experiments", {}).get("no_same_cycle_reentry", False))
+
 # How stale the UNDERLYING signal may be before it is refetched.
 #
 # The signal (EMA9/21 + VWAP) is computed on 5-MINUTE bars, so it cannot
@@ -785,6 +805,32 @@ def process(conn, log, today):
     if not in_window:
         conn.commit()
         return
+
+    # ---- EXPERIMENT: do not refill a slot from a PRE-EXIT candidate list -
+    # `candidates` was built above, before the position-management loop.
+    # If that loop closed anything, the list predates the exit, so acting
+    # on it now would re-enter on information gathered before the market
+    # told us to leave. End the entry evaluation instead; the next
+    # entry-eligible cycle rebuilds candidates from fresh signals.
+    #
+    # Exits, sizing, ranking, MAX_POSITIONS and the first BUY of the day
+    # are all untouched - the book is empty at 09:15, so the opening cycle
+    # closes nothing and this branch cannot fire there.
+    if EXPERIMENT_NO_SAME_CYCLE_REENTRY:
+        still_open = conn.execute(
+            "SELECT COUNT(*) FROM options_positions").fetchone()[0]
+        closed_this_cycle = len(positions) - still_open
+        if closed_this_cycle > 0:
+            print(f"  EXPERIMENT no_same_cycle_reentry: {closed_this_cycle} "
+                  f"position(s) closed this cycle - entry evaluation ended, "
+                  f"candidate list ({len(candidates)}) NOT reused. Next "
+                  f"entry-eligible cycle will rebuild from fresh signals.")
+            trace(event="entry_evaluation_ended",
+                  reason="same_cycle_exit_invalidates_candidates",
+                  closed_this_cycle=closed_this_cycle,
+                  candidates_discarded=len(candidates))
+            conn.commit()
+            return
 
     # ---- entries, on LIVE quotes only ----------------------------------
     # active mode: trade the ranked picks. shadow/off: baseline order,

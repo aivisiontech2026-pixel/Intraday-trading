@@ -76,5 +76,9 @@
       "min_volume": 100
     },
     "min_history_n": 10
+  },
+  "experiments": {
+    "_comment": "Controlled experiments. Absent or false = baseline behaviour. no_same_cycle_reentry: when a position is actually closed during a process() cycle, end that cycle's entry evaluation instead of refilling the freed slot from the candidate list built BEFORE the exit. Not a time-based cooldown. Authorized for the 2026-08-14 session only; revert to false afterwards unless separately extended.",
+    "no_same_cycle_reentry": true
   }
 }
