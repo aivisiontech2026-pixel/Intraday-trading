@@ -27,9 +27,15 @@ ATTRIBUTION MODEL
 Each closed trade's P&L is decomposed into causes that are separately
 actionable:
 
-  spread_cost     : (ask-bid) at entry x qty. Pure friction - the price
-                    paid to cross the book. Attributable to OPTION
-                    SELECTION (liquidity), not to the market call.
+  spread_cost     : ENTRY-SIDE HALF-SPREAD ONLY - (entry_ask - mid) x qty.
+                    The price paid to cross the book on the way IN.
+                    Attributable to OPTION SELECTION (liquidity), not to
+                    the market call.
+                    EXCLUDES exit-side spread, brokerage, STT, exchange
+                    charges, SEBI fees, stamp duty, GST and slippage
+                    beyond the quoted spread - none of which are modelled
+                    anywhere in this system. Treat it as a LOWER BOUND on
+                    friction, never as total trading cost.
   direction_pnl   : P&L that would have been earned at mid-to-mid.
                     Attributable to MARKET PREDICTION + STOCK SELECTION.
   exit_efficiency : realized exit vs the best mark seen while open
@@ -182,24 +188,37 @@ def live_trades(conn):
 
 # -------------------------------------------------- baseline vs ranked ---
 def compare_strategies(conn):
-    """Baseline vs what the ranked engine would have picked.
+    """Does the ranking score rank realized outcomes?
 
-    Uses the score stamped on each executed trade (shadow mode) - we can
-    only compare over trades the baseline ACTUALLY took, so this measures
-    'does score rank realized outcomes?', not 'would ranked have found
-    better trades elsewhere'. The latter needs the ranking_log rows for
-    candidates that were never traded, which only accumulate forward.
+    POPULATION: LIVE EXECUTED TRADES that carry a ranking score. These
+    are real fills, not simulations. The score was stamped at entry while
+    ranking ran in SHADOW mode, so it recorded an opinion without
+    influencing which trade was taken.
+
+    This is NOT a counterfactual. It cannot answer 'would ranked mode
+    have found better trades elsewhere', because it only sees trades the
+    baseline actually took. The broader candidate population - including
+    candidates never traded - lives in ranking_log and is NOT read here.
     """
+    # exit_time is APPENDED (index 2) so the existing positional accesses
+    # r[0]=score and r[1]=pnl keep their meaning. Reordering these columns
+    # would not raise - the values stay numeric and the report still
+    # renders - it would just make every statistic wrong. See
+    # test_trade_analytics.py, which pins this contract.
     rows = _rows(conn,
-                 "SELECT entry_score, pnl FROM options_trades "
+                 "SELECT entry_score, pnl, exit_time FROM options_trades "
                  "WHERE price_source IS NOT NULL AND entry_score IS NOT NULL")
     if not rows:
         return None
+    # Path-dependent statistics (drawdown) are computed CHRONOLOGICALLY.
+    # Ranking correlation needs score order. These are different orderings
+    # of the same rows, and conflating them silently mis-stated drawdown:
+    # walking the equity curve in score order produced a number that is
+    # not a drawdown of anything.
+    chronological = [r[1] for r in sorted(rows, key=lambda r: r[2])]
+    out = {"baseline_all": stats(chronological)}
+
     rows.sort(key=lambda r: -r[0])
-    pnls_all = [r[1] for r in rows]
-    out = {"baseline_all": stats(pnls_all)}
-    for k in (1, 2, 3):
-        out[f"top_{k}"] = stats([r[1] for r in rows[:k]])
     # rank correlation between score and outcome
     n = len(rows)
     if n >= 3:
@@ -212,6 +231,12 @@ def compare_strategies(conn):
         out["spearman"] = round(1 - 6 * d2 / (n * (n * n - 1)), 3)
     out["n"] = n
     out["comparison_sufficient"] = n >= MIN_N_COMPARISON
+    # Scope label: this report runs per session but the figures above span
+    # every scored live trade ever closed. Stating the range stops a daily
+    # reader from mistaking a cumulative total for today's result.
+    stamps = [r[2] for r in rows if r[2]]
+    if stamps:
+        out["date_range"] = f"({min(stamps)[:10]} -> {max(stamps)[:10]}, n={n})"
     return out
 
 
@@ -242,6 +267,7 @@ def build_report():
     A("=" * 78)
     A(f"Total option trades on record : {all_n}")
     A(f"LIVE-pricing-era trades       : {len(trades)}  <- the only valid evidence")
+    A("Reporting scope               : CUMULATIVE to date (not this session)")
     A(f"Excluded (synthetic-era)      : {all_n - len(trades)}")
     if not trades:
         A("\nNo live-era trades yet - nothing measurable.")
@@ -250,8 +276,10 @@ def build_report():
 
     A("")
     A("-" * 78)
-    A("PORTFOLIO STATISTICS (live-era only)")
+    A("PORTFOLIO STATISTICS - CUMULATIVE (live-era only)")
     A("-" * 78)
+    A("  Every figure below is CUMULATIVE across all live-era trades to")
+    A("  date, not today's session.")
     A(fmt_stats(stats([t[5] for t in trades]), "ALL live trades"))
 
     by_sym, by_reason, by_tier = learning_table(conn)
@@ -278,7 +306,8 @@ def build_report():
         if a["spread_cost"] is not None:
             tot_spread += a["spread_cost"]
             measurable += 1
-            A(f"    spread {a['spread_pct']}% -> cost Rs.{a['spread_cost']:,.0f}"
+            A(f"    spread {a['spread_pct']}% -> entry-side half-spread cost "
+              f"Rs.{a['spread_cost']:,.0f}"
               f" | direction-only P&L Rs.{a['direction_pnl']:,.0f}")
         else:
             A("    spread cost: NOT MEASURABLE (entry quote not recorded)")
@@ -287,21 +316,32 @@ def build_report():
             A(f"    rank score {a['score']:.3f} (rank #{a['rank']}, {a['tier']})")
     if measurable:
         A("")
-        A(f"  Total measurable spread cost: Rs.{tot_spread:,.0f} across "
-          f"{measurable} trades (Rs.{tot_spread/measurable:,.0f}/trade)")
+        A(f"  ENTRY-SIDE HALF-SPREAD COST (cumulative): Rs.{tot_spread:,.0f} "
+          f"across {measurable} trades (Rs.{tot_spread/measurable:,.0f}/trade)")
+        A("    Measures (entry_ask - mid) x qty only. EXCLUDES: exit-side")
+        A("    spread, brokerage, STT, exchange transaction charges, SEBI")
+        A("    fees, stamp duty, GST, and slippage beyond the quoted spread.")
+        A("    None of those are modelled anywhere, so this is a LOWER BOUND")
+        A("    on real trading friction - not a total cost of trading.")
 
     cmp_ = compare_strategies(conn)
     A("")
     A("-" * 78)
-    A("BASELINE vs RANKED (shadow evidence)")
+    A("DOES THE RANKING SCORE RANK OUTCOMES?")
     A("-" * 78)
+    A("  Population: LIVE EXECUTED TRADES carrying a ranking score, scored")
+    A("  at entry while ranking runs in SHADOW mode (the score recorded an")
+    A("  opinion; it did not choose the trade). These are real fills.")
+    A("  NOT a counterfactual: ranking_log holds the broader candidate")
+    A("  population, including candidates never traded, and is NOT included")
+    A("  here. Figures are CUMULATIVE over every scored live trade to date.")
     if not cmp_:
         A("  No scored trades yet. Shadow mode stamps a score on every trade")
         A("  from now on; this comparison populates as those trades close.")
     else:
-        A(fmt_stats(cmp_["baseline_all"], "baseline (all taken)"))
-        for k in (1, 2, 3):
-            A(fmt_stats(cmp_[f"top_{k}"], f"ranked top-{k} only"))
+        A("")
+        A(fmt_stats(cmp_["baseline_all"],
+                    f"CUMULATIVE {cmp_.get('date_range', '')}".rstrip()))
         if "spearman" in cmp_:
             A(f"\n  Spearman(score, realized P&L) = {cmp_['spearman']:+.3f}")
             A("    +1 = score perfectly ranks outcomes, 0 = no relationship")
