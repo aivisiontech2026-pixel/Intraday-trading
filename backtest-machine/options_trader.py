@@ -69,6 +69,9 @@ import yfinance as yf
 
 import angelone_client as angel
 import ranking_engine as ranking
+# Observability only (P0-E). Every call is fail-open and returns a value
+# no trading branch reads. See telemetry.py's architectural contract.
+import telemetry
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -387,6 +390,11 @@ def open_option(conn, rec, quote, spot, underlying_dir, today, log,
           rank=rank_pos if rank_pos is not None else "n/a", tier=tier or "n/a",
           price_source="LIVE_ASK" if ask > 0 else "LIVE_LTP")
 
+    # observability: entry decision with full contract identity
+    telemetry.emit_decision(
+        "ENTRY", reason=underlying_dir, token=rec.get("token"),
+        trading_symbol=rec.get("symbol"), entry_price=entry_px, qty=qty)
+
     msg = (f"📊 OPTIONS: BOUGHT {lots} lot(s) ({qty}) {rec['symbol']} "
            f"@ Rs.{entry_px:.2f}{tag} | cost Rs.{cost:,.0f} | "
            f"stop Rs.{initial_stop:.2f}")
@@ -447,6 +455,13 @@ def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None,
           qty=qty, pnl=f"{pnl:.0f}", pnl_pct=f"{pnl_pct:+.1f}%",
           reason=reason, price_source=src, peak_source=peak_source or "n/a",
           high_water=f"{pos.get('high_water') or pos['entry_price']:.2f}")
+
+    # observability: exit decision + the high-water mark that produced it.
+    # Captured here because the options_positions row is deleted above.
+    telemetry.emit_exit(
+        pos.get("token"), pos.get("trading_symbol"), reason,
+        exit_price=exit_px, high_water_at_exit=pos.get("high_water"),
+        peak_source=peak_source, pnl=pnl)
 
     emoji = "✅" if pnl > 0 else "❌"
     msg = (f"{emoji} OPTIONS: SOLD {pos.get('lots')} lot(s) ({qty}) "
@@ -534,6 +549,12 @@ def process(conn, log, today):
     now = datetime.now().astimezone()
     now_min = now.hour * 60 + now.minute
 
+    # --- observability: open a correlation cycle (additive, fail-open) ---
+    telemetry.new_cycle(
+        trading_date=today_str,
+        experiment_flags=("no_same_cycle_reentry="
+                          f"{EXPERIMENT_NO_SAME_CYCLE_REENTRY}"))
+
     # ---- live market data plumbing -------------------------------------
     # NOTE: every early return below MUST first run the square-off net.
     # On 2026-08-04 four positions were carried overnight because a
@@ -565,6 +586,7 @@ def process(conn, log, today):
     else:
         data = {}
         for name, ticker in UNIVERSE:
+            _req_at = datetime.now().isoformat(timespec="microseconds")
             try:
                 df = yf.download(ticker, period="5d", interval=INTERVAL,
                                  auto_adjust=True, progress=False,
@@ -574,10 +596,20 @@ def process(conn, log, today):
                 continue
             if df is None or df.empty:
                 continue
+            _recv_at = datetime.now().isoformat(timespec="microseconds")
             data[name] = {"spot": float(df["Close"].iloc[-1]),
                           "direction": get_direction(df),
                           "momentum": get_momentum(df, today),
                           "trend_quality": get_trend_quality(df)}
+            # observability: bar identity/status + a COMPLETED-BAR direction
+            # recorded for later comparison. Never read back, never used.
+            telemetry.emit_signal(
+                name, _req_at, _recv_at, df=df,
+                direction=data[name]["direction"],
+                momentum=data[name]["momentum"],
+                trend_quality=data[name]["trend_quality"],
+                spot=data[name]["spot"],
+                direction_fn=get_direction, session_date=today_str)
         if data:
             print(f"  Signals: refreshed {len(data)} symbols from yfinance")
     if "NIFTY" not in data:
@@ -643,8 +675,12 @@ def process(conn, log, today):
     # ---- ONE batched live-quote call for positions + candidates --------
     tokens = [p["token"] for p in positions if p.get("token")]
     tokens += [c["rec"]["token"] for c in candidates]
+    _q_req_at = datetime.now().isoformat(timespec="microseconds")
     quotes = angel.get_quotes(smart, list(dict.fromkeys(tokens)))
+    _q_recv_at = datetime.now().isoformat(timespec="microseconds")
     print(f"  Live quotes: {len(quotes)}/{len(set(tokens))} tokens fetched")
+    # observability: one snapshot per token, keyed for correlation
+    _qsnap = telemetry.emit_quotes(quotes, _q_req_at, _q_recv_at) or {}
 
     # ---- ranking engine: score every candidate, every cycle ------------
     # In "shadow" (default) this ONLY logs and stamps scores - the
@@ -750,6 +786,15 @@ def process(conn, log, today):
                       max(day_high, prev_high), min(day_low, prev_low) if day_low
                       else prev_low, peak_source, pos["id"]))
         pos["high_water"], pos["stop_price"] = high_water, stop_price
+
+        # observability: per-cycle position state, incl. the high-water mark
+        # that is otherwise lost when the position row is DELETEd on close.
+        telemetry.emit_position(
+            token, pos.get("trading_symbol"), mark=mark,
+            high_water=high_water, stop_price=stop_price,
+            day_high_seen=day_high, day_low_seen=day_low,
+            peak_source=peak_source, trigger_value=trigger,
+            quote_snapshot_id=_qsnap.get(str(token)))
 
         trace(event="mark", ts=datetime.now().isoformat(timespec="seconds"),
               symbol=pos.get("trading_symbol"), token=token,
@@ -902,6 +947,12 @@ def selfcheck(conn):
     global trace, telegram
     real_trace, trace = trace, lambda **kw: None
     real_tg, telegram = telegram, lambda msg: None
+    # THIRD sink: close_option() also emits observability. The savepoint
+    # below rolls back the trade row but cannot roll back a write to a
+    # different database, so the probe was minting a phantom _SELFCHECK
+    # exit every cycle. Suppress at the sink, not downstream.
+    _sim = telemetry.simulation()
+    _sim.__enter__()
     try:
         conn.execute("SAVEPOINT selfcheck")
         conn.execute(
@@ -922,6 +973,7 @@ def selfcheck(conn):
         raise
     finally:
         trace, telegram = real_trace, real_tg
+        _sim.__exit__(None, None, None)
         conn.execute("ROLLBACK TO selfcheck")
         conn.execute("RELEASE selfcheck")
     return True
@@ -931,6 +983,11 @@ def main():
     conn = db_init()
     today = date.today()
     log = []
+
+    # Observability store: a SEPARATE file. Production books are never
+    # opened by telemetry. Per-run only - it is deliberately NOT in
+    # state_sync's owned list, so nothing about state persistence changes.
+    telemetry.init()
 
     selfcheck(conn)   # aborts loudly if open/close SQL is broken
 
@@ -946,6 +1003,7 @@ def main():
                   f"(high {p['high_water']:.2f}, stop {p['stop_price']:.2f})")
 
     process(conn, log, today)
+    telemetry.close_cycle()   # observability only; fail-open
     if log:
         print("\n".join(log))
     conn.close()

@@ -241,6 +241,10 @@ def get_quotes(smart, tokens):
     tokens = [str(t) for t in tokens]
     for i in range(0, len(tokens), QUOTE_BATCH):
         batch = tokens[i:i + QUOTE_BATCH]
+        # Receive time, recorded for latency measurement ONLY. It is never
+        # used as a substitute for the exchange feed time - that would
+        # measure our own latency and mislabel it market staleness.
+        received_at = datetime.now().isoformat(timespec="microseconds")
         try:
             resp = smart.getMarketData("FULL", {NFO: batch})
         except Exception as e:
@@ -269,6 +273,16 @@ def get_quotes(smart, tokens):
                     "low": float(row.get("low") or 0),
                     "close": float(row.get("close") or 0),
                     "trading_symbol": row.get("tradingSymbol", ""),
+                    # ---- temporal observability (P0-E), ADDITIVE ----------
+                    # The FULL response carries exchange-side timestamps
+                    # that were previously parsed away, which is why quote
+                    # age has never been measurable. Preserved verbatim -
+                    # None when the broker omits them. Nothing reads these
+                    # for a trading decision; they exist so staleness can
+                    # be MEASURED instead of assumed.
+                    "exch_feed_time": row.get("exchFeedTime"),
+                    "exch_trade_time": row.get("exchTradeTime"),
+                    "received_at": received_at,
                 }
             except (KeyError, ValueError, TypeError):
                 continue
