@@ -21,17 +21,36 @@ from pathlib import Path
 import numpy as np
 import yfinance as yf
 
+import config_contract
+# Independent safety layer (S-04/S-06). This book's Rs.2,000 daily-loss
+# limit is enforced against THIS book's ledger only - an options loss
+# must never halt stock entries, and vice versa.
+import safety_supervisor
+
 HERE = Path(__file__).parent
 DB = HERE / "simple_trades.db"
 CFG_FILE = HERE / "intraday_config.json"
 CFG = json.loads(CFG_FILE.read_text()) if CFG_FILE.exists() else {}
 
-CAPITAL = 100_000
-MAX_PER_TRADE = 25_000
+# S-03: same authoritative contract as the options engine. Values verified
+# equal to the constants previously hardcoded here, so this is
+# value-neutral.
+CONTRACT = config_contract.Contract(CFG)
+
+CAPITAL = CONTRACT.capital
+MAX_PER_TRADE = CONTRACT.max_per_trade
 PROFIT_POINTS = 25  # target profit in rupees per share
 STOP_LOSS_PCT = -0.01  # -1% stop
-T_ENTRY = 9 * 60 + 30  # 09:30 IST
-T_SQUARE_OFF = 15 * 60 + 15  # 15:15 IST
+T_ENTRY = 9 * 60 + 30  # 09:30 IST  == contract entry_start
+# S-28: entry CUTOFF. Not a new policy - `entry_end` is already declared in
+# the shared intraday_config.json, documented in README.md, and enforced
+# against STOCK trading by intraday_backtest.py, whose strategy contract
+# states "Time window: entries allowed 09:30 - 14:30 IST only". This engine
+# already matched the contract on entry_start, square_off, capital and
+# max_capital_per_trade; entry_end was the one shared key with no
+# counterpart here, which is exactly why a late entry was possible.
+T_ENTRY_END = CONTRACT.entry_end  # 14:30 IST == contract entry_end
+T_SQUARE_OFF = 15 * 60 + 15  # 15:15 IST  == contract square_off
 SYMBOLS = ["RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS"]
 
 # ----------------------------------------------------------------- db ---
@@ -96,8 +115,34 @@ def process(conn, log, today):
     # window - a narrow window would silently miss entries if the CI job's
     # polling cadence doesn't happen to land inside it, e.g. every 15 min).
     entries_done_key = f"entries_done:{today}"
-    if now_min >= T_ENTRY and not meta_get(conn, entries_done_key):
-        meta_set(conn, entries_done_key, "1")
+    # S-04/S-06: supervisor consulted BEFORE any entry work. Blocks NEW
+    # ENTRIES only - the exit loop below is deliberately outside this gate,
+    # so a halted book still runs its stop, profit target and 15:15 close.
+    entry_allowed, safety_state = safety_supervisor.entry_permission(
+        conn, safety_supervisor.STOCK_BOOK, today,
+        CONTRACT.capital, CONTRACT.max_daily_loss_percent)
+    if not entry_allowed:
+        print(f"  SAFETY SUPERVISOR (stock book): new entries BLOCKED "
+              f"({safety_state['reason']}) | realized today "
+              f"Rs.{safety_state['realized_today']} | session low "
+              f"Rs.{safety_state['realized_low_water']} | limit "
+              f"Rs.{safety_state['limit']}. Existing positions REMAIN "
+              f"risk-managed.")
+
+    # S-28: the flag was previously set BEFORE the loop, so a cycle that
+    # found no usable prices burned the one daily attempt and silently
+    # disabled stock entries for the whole session. It is now set only
+    # after at least one entry actually succeeds.
+    #
+    # That retry, on its own, had NO upper bound: if data was unavailable
+    # all morning and recovered at 15:10, four positions were opened five
+    # minutes before the 15:15 square-off. The cutoff below closes that
+    # path. It bounds ENTRIES ONLY - the exit loop that follows is
+    # deliberately outside this block, so stops, profit targets and the
+    # square-off keep running on any open position afterwards.
+    if (entry_allowed and T_ENTRY <= now_min <= T_ENTRY_END
+            and not meta_get(conn, entries_done_key)):
+        entered_any = False
         for sym in SYMBOLS:
             if sym not in positions and sym in prices:
                 entry_px = prices[sym]
@@ -106,9 +151,12 @@ def process(conn, log, today):
                     conn.execute("INSERT INTO positions VALUES(?,?,?,?)",
                                (sym, qty, entry_px, now.isoformat()))
                     meta_set(conn, "cash", cash(conn) - entry_px * qty * 1.0003)
+                    entered_any = True
                     msg = f"📈 BOUGHT {sym} x{qty} @ Rs.{entry_px:.2f} (entry at open)"
                     log.append(msg)
                     telegram(msg)
+        if entered_any:
+            meta_set(conn, entries_done_key, "1")
 
     # ---- EXIT: Profit target, stop loss, or market close
     for sym, pos in list(positions.items()):

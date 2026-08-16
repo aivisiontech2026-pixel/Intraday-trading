@@ -69,6 +69,11 @@ import yfinance as yf
 
 import angelone_client as angel
 import ranking_engine as ranking
+import config_contract
+# Independent safety layer (S-04/S-06). Sits ABOVE the strategy: it can
+# withhold NEW-ENTRY permission and can do nothing else. It never closes,
+# sizes or selects a position, and the strategy cannot disable it.
+import safety_supervisor
 # Observability only (P0-E). Every call is fail-open and returns a value
 # no trading branch reads. See telemetry.py's architectural contract.
 import telemetry
@@ -80,18 +85,27 @@ DB = HERE / "options_trades.db"
 CFG_FILE = HERE / "intraday_config.json"
 CFG = json.loads(CFG_FILE.read_text()) if CFG_FILE.exists() else {}
 
-CAPITAL = 100_000
-MAX_PER_TRADE = 25_000      # per-position premium budget (>=1 real lot)
+# S-03: one authoritative configuration source. Each value below was
+# verified equal to the constant previously hardcoded here, so adopting
+# the contract is value-neutral. See config_contract.py for the full
+# classification of every declared key, including the ones that remain
+# DEFERRED (cost_per_side, slippage, risk_per_trade_percent) because
+# enforcing them would change P&L or sizing - strategy behaviour, out of
+# scope for stabilization.
+CONTRACT = config_contract.Contract(CFG)
+
+CAPITAL = CONTRACT.capital                  # 100_000
+MAX_PER_TRADE = CONTRACT.max_per_trade      # 25_000
 INITIAL_STOP_PCT = -0.15
 TRAIL_ACTIVATE_PCT = 0.10
 TRAIL_PCT = 0.12
-T_SQUARE_OFF = 15 * 60 + 15
-INTERVAL = "5m"
+T_SQUARE_OFF = CONTRACT.square_off          # 15:15
+INTERVAL = CONTRACT.interval                # "5m"
 
 MIN_DAILY_TRADES = 5
-MAX_POSITIONS = 4           # 4 x Rs.25,000 = the full Rs.100,000 book
+MAX_POSITIONS = CONTRACT.max_positions      # 4 x Rs.25,000 = full book
 FALLBACK_START_MIN = 11 * 60
-T_ENTRY_START, T_ENTRY_END = 9 * 60 + 30, 14 * 60 + 30
+T_ENTRY_START, T_ENTRY_END = CONTRACT.entry_start, CONTRACT.entry_end
 
 # EXPERIMENT (default OFF): same-cycle candidate-reuse guard.
 #
@@ -273,8 +287,15 @@ def get_direction(df):
     """
     if df is None or df.empty or len(df) < 21:
         return None
-    ema9 = df["Close"].ewm(span=9).mean().iloc[-1]
-    ema21 = df["Close"].ewm(span=21).mean().iloc[-1]
+    # S-02: adjust=False matches backtest.py::ema() and the documented
+    # definition. Live previously used the pandas default adjust=True,
+    # which is a different estimator. P0-A replayed all 87 reconstructable
+    # entries under both and found ZERO direction flips - so this is a
+    # parity correction with no observed decision impact in that window.
+    # It is NOT claimed to be universally behaviour-neutral: the two
+    # estimators differ numerically and could diverge on future data.
+    ema9 = df["Close"].ewm(span=9, adjust=False).mean().iloc[-1]
+    ema21 = df["Close"].ewm(span=21, adjust=False).mean().iloc[-1]
     vol = df["Volume"].sum()
     if vol:
         vwap = (df["Close"] * df["Volume"]).sum() / vol
@@ -295,8 +316,9 @@ def get_trend_quality(df):
     ranking engine scores freshness higher - see ranking_engine.py."""
     if df is None or df.empty or len(df) < 21:
         return 0.5
-    ema9 = df["Close"].ewm(span=9).mean()
-    ema21 = df["Close"].ewm(span=21).mean()
+    # S-02: same estimator as get_direction, for internal consistency.
+    ema9 = df["Close"].ewm(span=9, adjust=False).mean()
+    ema21 = df["Close"].ewm(span=21, adjust=False).mean()
     up_now = ema9.iloc[-1] > ema21.iloc[-1]
     tail = (ema9 > ema21).tail(12)
     return float(tail.mean()) if up_now else float((~tail).mean())
@@ -569,12 +591,17 @@ def process(conn, log, today):
         square_off_net(conn, log, now_min, "Angel One unavailable")
         conn.commit()
         return
+    # S-05 RISK-MANAGEMENT ISOLATION.
+    # The instrument master is an ENTRY-side dependency: open positions
+    # already carry their own token and need nothing from it. Previously
+    # its failure returned here, skipping the position-management loop
+    # entirely - so a data outage could leave a position past its stop
+    # with live quotes available and unused. It no longer gates exits;
+    # it only disables NEW candidate construction below.
     master = angel.load_instrument_master(UNIVERSE_NAMES)
     if not master:
-        print("  Instrument master unavailable -> no NEW option trades.")
-        square_off_net(conn, log, now_min, "instrument master unavailable")
-        conn.commit()
-        return
+        print("  Instrument master unavailable -> no NEW option trades "
+              "(existing positions ARE still risk-managed this cycle).")
 
     # ---- underlying signals (yfinance 5-min bars, refreshed on the bar
     # cadence rather than every cycle - see SIGNAL_MAX_AGE_SEC) ----------
@@ -612,17 +639,25 @@ def process(conn, log, today):
                 direction_fn=get_direction, session_date=today_str)
         if data:
             print(f"  Signals: refreshed {len(data)} symbols from yfinance")
-    if "NIFTY" not in data:
-        print("  No underlying data -> no NEW option trades this cycle.")
-        square_off_net(conn, log, now_min, "no underlying data")
-        conn.commit()
-        return
+    # S-05 RISK-MANAGEMENT ISOLATION.
+    # Underlying signals are an ENTRY-side dependency. Open positions need
+    # them only for the trend-reversal check, which correctly degrades to
+    # "no reversal signal" when direction is None. Stops, trailing stops,
+    # expiry and square-off need only the option quote. Previously a
+    # yfinance failure returned here and skipped position management
+    # entirely - the single highest-severity coupling the audit found.
+    # It now disables NEW candidate construction and nothing else.
+    signals_available = "NIFTY" in data
+    if not signals_available:
+        print("  No underlying data -> no NEW option trades this cycle "
+              "(existing positions ARE still risk-managed).")
 
     # relative strength: today's move vs NIFTY's (evidence: the strongest
     # measured ranking feature - see ranking_engine.py header)
-    nifty_mom = data["NIFTY"]["momentum"]
-    for name, info in data.items():
-        info["rel_strength"] = round(info["momentum"] - nifty_mom, 3)
+    if signals_available:
+        nifty_mom = data["NIFTY"]["momentum"]
+        for name, info in data.items():
+            info["rel_strength"] = round(info["momentum"] - nifty_mom, 3)
     if signals_fresh:
         save_cached_signals(conn, data, now)
 
@@ -635,7 +670,32 @@ def process(conn, log, today):
     # here purely to mark positions and enforce stops against live option
     # quotes - opening a new position off a signal it already acted on
     # would just re-trade the same bar.
-    in_window = (T_ENTRY_START <= now_min <= T_ENTRY_END) and signals_fresh
+    #
+    # S-04/S-06: the supervisor is consulted BEFORE any candidate work and
+    # can only ever REMOVE entry permission. It is asked here, above the
+    # strategy, and the strategy has no path that bypasses it. A halt
+    # blocks NEW ENTRIES only - the position-management loop below is
+    # deliberately outside this gate.
+    #
+    # S-05: master/signals are ENTRY-side requirements. Their absence
+    # suppresses candidates; it never reaches position management.
+    entry_allowed, safety_state = safety_supervisor.entry_permission(
+        conn, safety_supervisor.OPTIONS_BOOK, today,
+        CONTRACT.capital, CONTRACT.max_daily_loss_percent)
+    if not entry_allowed:
+        print(f"  SAFETY SUPERVISOR: new entries BLOCKED "
+              f"({safety_state['reason']}) | realized today "
+              f"Rs.{safety_state['realized_today']} | session low "
+              f"Rs.{safety_state['realized_low_water']} | limit "
+              f"Rs.{safety_state['limit']}. Existing positions REMAIN "
+              f"risk-managed.")
+    telemetry.emit_decision(
+        "ENTRY_PERMISSION", reason=safety_state["reason"],
+        trading_symbol=safety_state["book"])
+
+    in_window = (T_ENTRY_START <= now_min <= T_ENTRY_END
+                 and signals_fresh and signals_available and bool(master)
+                 and entry_allowed)
 
     candidates = []   # dicts: name/rec/direction/tier/tag + score features
     if in_window:
@@ -682,33 +742,21 @@ def process(conn, log, today):
     # observability: one snapshot per token, keyed for correlation
     _qsnap = telemetry.emit_quotes(quotes, _q_req_at, _q_recv_at) or {}
 
-    # ---- ranking engine: score every candidate, every cycle ------------
+    # ---- ranking engine: SCORING ---------------------------------------
     # In "shadow" (default) this ONLY logs and stamps scores - the
     # baseline keeps deciding. In "active" the ranked selection decides.
+    # Scores depend only on the candidate and its quote, so they are
+    # computed here, next to the quote fetch. SELECTION is deliberately
+    # deferred until after position management (see S-25 below).
     rcfg = ranking.get_config(CFG)
     rank_mode = rcfg.get("mode", "shadow")
-    ranked = []
+    ranked, picks, rejections = [], [], []
     if candidates and rank_mode != "off":
         for c in candidates:
             c["quote"] = quotes.get(c["rec"]["token"])
         history = ranking.load_history(conn, rcfg["min_history_n"])
         ranked = ranking.rank(candidates, data["NIFTY"]["direction"],
                               rcfg, history)
-        open_sectors = {}
-        for p in positions:
-            sec = ranking.SECTOR.get(p["symbol"], "Other")
-            open_sectors[sec] = open_sectors.get(sec, 0) + 1
-        slots = max(0, MAX_POSITIONS - open_count)
-        picks, rejections = ranking.select(ranked, rcfg, open_sectors, slots)
-        ranking.log_cycle(conn, rank_mode, ranked, picks)
-        for c in ranked:
-            trace(event="rank", symbol=c["name"], rank=c["rank"],
-                  score=c["score"], tier=c["tier"],
-                  would_trade=1 if c in picks else 0)
-        if rank_mode == "active":
-            for c, why in rejections:
-                trace(event="rank_rejected", symbol=c["name"],
-                      score=c["score"], reason=why)
 
     # ---- manage open positions on LIVE prices --------------------------
     for pos in positions:
@@ -846,6 +894,46 @@ def process(conn, log, today):
         elif now_min >= T_SQUARE_OFF:
             close_option(conn, pos, mark, "Square-off 15:15", log, q,
                          peak_source=peak_source)
+
+    # ---- ranking engine: SELECTION (S-25) ------------------------------
+    # Selection runs HERE, after the position-management loop, because
+    # both of its capacity inputs are only correct post-exit:
+    #
+    #   slots        MAX_POSITIONS - open positions
+    #   open_sectors per-sector counts feeding max_per_sector
+    #
+    # Both were previously derived from `positions`, the list loaded
+    # BEFORE any exit ran. A cycle that closed two positions still logged
+    # slots as if those positions were open, so candidates the baseline
+    # then went on to enter were recorded `would_trade=0` with reason
+    # "tier budget reached (0)". The live entry path re-reads the count
+    # from the database at this point (see below); the shadow path did
+    # not, so shadow and live disagreed on capacity by construction and
+    # the shadow evidence understated what ranking would have done.
+    #
+    # Reading both from the database - the same source, at the same point
+    # in the cycle, as the live path - removes the divergence. Scores and
+    # rank order are computed above and are unaffected; only the
+    # capacity-dependent `would_trade` flag changes.
+    if ranked:
+        open_rows = conn.execute(
+            "SELECT symbol FROM options_positions").fetchall()
+        open_sectors = {}
+        for (sym,) in open_rows:
+            sec = ranking.SECTOR.get(sym, "Other")
+            open_sectors[sec] = open_sectors.get(sec, 0) + 1
+        slots = max(0, MAX_POSITIONS - len(open_rows))
+        picks, rejections = ranking.select(ranked, rcfg, open_sectors, slots)
+        ranking.log_cycle(conn, rank_mode, ranked, picks)
+        pick_names = {c["name"] for c in picks}
+        for c in ranked:
+            trace(event="rank", symbol=c["name"], rank=c["rank"],
+                  score=c["score"], tier=c["tier"],
+                  would_trade=1 if c["name"] in pick_names else 0)
+        if rank_mode == "active":
+            for c, why in rejections:
+                trace(event="rank_rejected", symbol=c["name"],
+                      score=c["score"], reason=why)
 
     if not in_window:
         conn.commit()

@@ -111,18 +111,25 @@ jobs:
           # with fewer closed trades than the branch already holds.
           python state_sync.py save --own intraday_trades.db,simple_trades.db,options_trades.db
 
+      - name: Persist observability (end of session only)
+        if: always()
+        env:
+          # Same authoritative URL the trading-state save above uses.
+          # Without it state_sync cannot reach the branch and the step
+          # exits 1 every day after square-off while persisting nothing.
+          STATE_REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+        run: |
+          cd backtest-machine
+          # K: ONE synchronisation per day. A no-op on every cycle before
+          # square-off, so this step is safe to run on all ~45 cycles.
+          # observability.db belongs to THIS workflow only.
+          python state_sync.py save --own observability.db --eod
+
       - name: Publish dashboard (GitHub Pages)
         if: always()
         run: |
           cd backtest-machine
           python generate_dashboard.py
-          cd site
-          git init -q
-          git checkout -q -b gh-pages
-          git add -A
-          git -c user.name="intraday-ci" \
-              -c user.email="ci@users.noreply.github.com" \
-              commit -q -m "dashboard $(date -u +%FT%TZ)"
-          git push -f \
-            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
-            gh-pages
+          # S-30: idempotent publish - fast-forward, and skips the push
+          # (and so the Pages build) when the dashboard is unchanged.
+          bash publish_pages.sh "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"

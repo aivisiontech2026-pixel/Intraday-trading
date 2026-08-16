@@ -65,8 +65,18 @@ MONOTONIC = {
     "simple_trades.db": "trades",
     "market_memory.db": "daily_memory",
     "intraday_trades.db": "closed_trades",
+    # Observability. `cycle` gets exactly one row per run and is never
+    # deleted, so it is the natural monotonic guard - a run that lost the
+    # database cannot push an emptier one over a full one.
+    "observability.db": "cycle",
 }
 ALL_FILES = list(MONOTONIC)
+
+# Databases that are NOT trading state and follow a different sync policy.
+# observability.db is written every cycle but synchronised ONCE per day,
+# after square-off. Pushing it per cycle would add ~45 commits/hour to the
+# state branch to persist data nothing reads intraday.
+EOD_ONLY = {"observability.db"}
 
 
 def run(cmd, cwd=None, check=True, quiet=False):
@@ -116,8 +126,34 @@ def clone_branch(dest):
     return True
 
 
+# --------------------------------------------------------- session timing ---
+def past_square_off(now=None):
+    """True once the trading session's square-off time has passed.
+
+    Read from the SAME configuration contract the engines run on, so the
+    persistence boundary cannot drift away from the trading boundary.
+    Falls back to 15:15 IST - the hardcoded engine constant - if the
+    contract cannot be loaded, rather than guessing a different time.
+    """
+    from datetime import datetime
+    now = now or datetime.now()
+    try:
+        import config_contract
+        cutoff = config_contract.Contract().square_off
+    except Exception:
+        cutoff = 15 * 60 + 15
+    return (now.hour * 60 + now.minute) >= cutoff
+
+
 # ------------------------------------------------------------------ restore ---
-def restore():
+def restore(skip=()):
+    """Restore databases from the branch.
+
+    `skip` lets a workflow decline files it does not own. The pre-market
+    workflow uses it for observability.db: that database belongs to the
+    intraday workflow alone, and pre-market must neither write nor
+    synchronise it.
+    """
     with tempfile.TemporaryDirectory() as td:
         repo = Path(td) / "state"
         if not clone_branch(repo):
@@ -125,6 +161,9 @@ def restore():
             return 0
         restored, skipped = [], []
         for fname, table in MONOTONIC.items():
+            if fname in skip:
+                print(f"  skipping {fname} (not owned by this workflow)")
+                continue
             src = repo / fname
             if not src.exists() or src.stat().st_size == 0:
                 skipped.append(f"{fname} (absent/empty on branch)")
@@ -145,12 +184,37 @@ def restore():
 
 
 # --------------------------------------------------------------------- save ---
-def save(own, allow_regression=False):
+def save(own, allow_regression=False, eod=False):
     own = [f.strip() for f in own.split(",") if f.strip()]
     unknown = [f for f in own if f not in MONOTONIC]
     if unknown:
         print(f"  ! unknown file(s) in --own: {unknown}")
         return 1
+
+    # END-OF-SESSION POLICY.
+    #
+    # observability.db is appended to on every cycle but is only useful as
+    # a complete session, and nothing reads it back intraday. Synchronising
+    # it per cycle would mean ~45 pushes/hour to the state branch for data
+    # no decision depends on. It is therefore saved once, after square-off.
+    #
+    # Before square-off the request is a NO-OP, not an error: the same
+    # workflow step runs on every cycle and must stay silent until the
+    # session ends. The database is not lost by skipping - it is rebuilt
+    # from the branch on the next restore and appended to.
+    if not eod:
+        deferred = [f for f in own if f in EOD_ONLY]
+        if deferred:
+            print(f"  deferred to end-of-session: {', '.join(deferred)}")
+        own = [f for f in own if f not in EOD_ONLY]
+    else:
+        own = [f for f in own if f in EOD_ONLY]
+        if not past_square_off():
+            print("  end-of-session save requested before square-off "
+                  "- nothing to do yet.")
+            return 0
+    if not own:
+        return 0
 
     for attempt in range(1, 4):
         with tempfile.TemporaryDirectory() as td:
@@ -215,10 +279,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["restore", "save"])
     ap.add_argument("--own", default=",".join(ALL_FILES))
+    ap.add_argument("--skip", default="",
+                    help="restore: files this workflow does not own")
     ap.add_argument("--allow-regression", action="store_true",
                     help="override the regression guard (recovery only)")
+    ap.add_argument("--eod", action="store_true",
+                    help="save: end-of-session databases only, and only "
+                         "once square-off has passed")
     a = ap.parse_args()
-    return restore() if a.action == "restore" else save(a.own, a.allow_regression)
+    if a.action == "restore":
+        return restore(skip={f.strip() for f in a.skip.split(",") if f.strip()})
+    return save(a.own, a.allow_regression, a.eod)
 
 
 if __name__ == "__main__":

@@ -54,7 +54,9 @@ jobs:
           STATE_REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
         run: |
           cd backtest-machine
-          python state_sync.py restore
+          # observability.db belongs to the intraday workflow; this
+          # workflow must neither write nor synchronise it (K).
+          python state_sync.py restore --skip observability.db
 
       - name: Inject Telegram secrets
         run: |
@@ -116,13 +118,6 @@ jobs:
         run: |
           cd backtest-machine
           python generate_dashboard.py
-          cd site
-          git init -q
-          git checkout -q -b gh-pages
-          git add -A
-          git -c user.name="intraday-ci" \
-              -c user.email="ci@users.noreply.github.com" \
-              commit -q -m "dashboard $(date -u +%FT%TZ)"
-          git push -f \
-            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
-            gh-pages
+          # S-30: idempotent publish - fast-forward, and skips the push
+          # (and so the Pages build) when the dashboard is unchanged.
+          bash publish_pages.sh "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"

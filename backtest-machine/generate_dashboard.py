@@ -99,18 +99,49 @@ def collect():
                 excluded += skipped[0][0] if skipped else 0
         else:
             exit_col = "exit_px" if label == "Stocks" else "exit"
-            rows = q(dbfile, f"SELECT exit_time, symbol, pnl, reason FROM {ttable}")
+            rows = q(dbfile, f"SELECT exit_time, symbol, pnl, reason, "
+                             f"qty, entry, {exit_col} FROM {ttable}")
             pos = q(dbfile, f"SELECT symbol, qty, entry FROM {ptable}")
 
-        total = 0.0
+        total = 0.0        # gross, as stored
+        costs = 0.0        # what this book's cash path actually charged
         wins = 0
-        for et, sym, pnl, reason in rows:
+        for row in rows:
+            et, sym, pnl, reason = row[:4]
             pnl = pnl or 0.0
             total += pnl
-            wins += 1 if pnl > 0 else 0
+            # S-29: cost is charged per trade so the daily series, the
+            # cumulative line and the tiles all sit on ONE basis. Without
+            # this the charts stayed gross while the totals went net.
+            cost = 0.0
+            if len(row) > 4:
+                qy, e, x = row[4] or 0, row[5] or 0, row[6] or 0
+                cost = (e * qy * 0.0003) + (x * qy * 0.0003)
+            costs += cost
+            pnl_net = pnl - cost
+            wins += 1 if pnl_net > 0 else 0
             d = (et or "")[:10]
-            daily[d] = daily.get(d, 0.0) + pnl
-            trades.append((et or "", label, sym, pnl, reason or ""))
+            daily[d] = daily.get(d, 0.0) + pnl_net
+            trades.append((et or "", label, sym, pnl_net, reason or ""))
+
+        # S-29: GROSS vs NET.
+        #
+        # The stock books' stored `pnl` column is GROSS - (exit-entry)*qty,
+        # verified exact on all 56 rows. Their CASH path is not: entries
+        # debit entry*qty*1.0003 and exits credit exit*qty*0.9997, so cash
+        # carries a round-trip cost the P&L column never sees. Printing the
+        # two side by side stated that Rs.100,000 of capital had become
+        # Rs.99,443.91 while simultaneously reporting +Rs.411.80 of profit.
+        #
+        # Reported on the same basis as the cash that book actually holds:
+        # net = gross - the cost that book's own cash path applied. The
+        # stored column is NOT rewritten - exit conditions and the daily-loss
+        # supervisor both read it, so changing it would change trading
+        # behaviour. This is presentation only.
+        #
+        # The options book applies no cost multiplier on its cash path, so
+        # its net equals its gross and its number is unchanged.
+        net = total - costs
 
         # The stored cash balance still carries the excluded trades' fictional
         # proceeds, so reporting it here would contradict the P&L beside it.
@@ -119,8 +150,16 @@ def collect():
         if label == "Options" and excluded:
             cash = CAPITAL + total
 
+        # Whatever cash and the ledger still disagree on after costs is
+        # shown, not absorbed. For the Simple book this is -Rs.144.05 that
+        # 56 complete round trips, all with exact gross P&L and no orphaned
+        # or overnight positions, do not account for. Its origin is not
+        # established, so it is surfaced rather than explained away.
+        residual = cash - (CAPITAL + net) if len(rows) else 0.0
+
         books.append({"label": label, "cash": cash, "trades": len(rows),
-                      "wins": wins, "pnl": total})
+                      "wins": wins, "pnl": net, "gross": total,
+                      "costs": costs, "residual": residual})
         for prow in pos:
             positions.append((label, *prow))
 
@@ -274,9 +313,9 @@ def render():
 
     tiles = f"""
     <div class="tiles">
-      <div class="tile"><div class="k">All-time P&amp;L <span class="sub">(real prices)</span></div>
+      <div class="tile"><div class="k">All-time P&amp;L <span class="sub">(real prices, net of costs)</span></div>
         <div class="v">Rs.{total_pnl:,.0f}</div>{delta(total_pnl)}</div>
-      <div class="tile"><div class="k">Today's realized P&amp;L</div>
+      <div class="tile"><div class="k">Today's realized P&amp;L <span class="sub">(net)</span></div>
         <div class="v">Rs.{today_pnl:,.0f}</div>{delta(today_pnl)}</div>
       <div class="tile"><div class="k">Trades / win rate</div>
         <div class="v">{n_trades} <span class="sub">/ {win_rate:.0f}%</span></div></div>
@@ -284,11 +323,30 @@ def render():
         <div class="v">{acc:.0f}% <span class="sub">({n_calls} calls)</span></div></div>
     </div>"""
 
+    def resid_cell(v):
+        return f"Rs.{v:+,.2f}" if abs(v) >= 0.01 else "&mdash;"
+
     book_rows = "".join(
         f"<tr><td>{esc(b['label'])}</td><td class='num'>Rs.{b['cash']:,.0f}</td>"
         f"<td class='num'>{b['trades']}</td>"
-        f"<td class='num {'up' if b['pnl']>=0 else 'down'}'>Rs.{b['pnl']:,.0f}</td></tr>"
+        f"<td class='num'>Rs.{b['gross']:,.0f}</td>"
+        f"<td class='num'>Rs.{b['costs']:,.0f}</td>"
+        f"<td class='num {'up' if b['pnl']>=0 else 'down'}'>Rs.{b['pnl']:,.0f}</td>"
+        f"<td class='num'>{resid_cell(b['residual'])}</td></tr>"
         for b in books)
+
+    unrec = [b for b in books if abs(b["residual"]) >= 0.01]
+    recon_note = ""
+    if unrec:
+        detail = "; ".join(f"{b['label']} Rs.{b['residual']:+,.2f}" for b in unrec)
+        recon_note = (
+            f'<p class="note">Every figure on this page is <strong>net of the '
+            f'0.03% per-side cost each book&rsquo;s cash path actually '
+            f'charges</strong>. The stored P&amp;L column is gross; the '
+            f'difference is shown as Costs rather than folded in silently. '
+            f'<strong>Unreconciled: {esc(detail)}</strong> &mdash; cash that '
+            f'the closed-trade ledger does not account for even after costs. '
+            f'The cause is not established, so it is reported, not absorbed.</p>')
 
     pos_rows = "".join(
         f"<tr><td>{esc(bk)}</td><td>{esc(sym).replace('.NS','')}</td>"
@@ -391,7 +449,9 @@ th.num {{ text-align: right; }}
 <div class="card"><h2>Cumulative P&amp;L</h2>{cumulative_line_chart(daily)}</div>
 <div class="card"><h2>Books</h2>
 <table><tr><th>Book</th><th class="num">Cash</th><th class="num">Trades</th>
-<th class="num">P&amp;L</th></tr>{book_rows}</table></div>
+<th class="num">P&amp;L gross</th><th class="num">Costs</th>
+<th class="num">P&amp;L net</th><th class="num">Unreconciled</th></tr>
+{book_rows}</table>{recon_note}</div>
 <div class="card"><h2>Open positions</h2>
 <table><tr><th>Book</th><th>Symbol</th><th class="num">Qty</th>
 <th class="num">Entry</th></tr>{pos_rows}</table></div>

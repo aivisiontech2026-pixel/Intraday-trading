@@ -47,6 +47,27 @@ only contribute once it has >= min_history_n closed trades under the
 live-pricing engine; before that its contribution is neutral (0.5).
 This prevents overfitting to a handful of early trades. Only LIVE-era
 trades count (price_source set); synthetic-era records are excluded.
+
+S-26 CORRECTIONS (shadow scoring only - see feature_scores)
+-----------------------------------------------------------
+  * risk_reward was a hardcoded constant, never computed. Weight 0.05
+    -> 0.00.
+  * history scored win rate while discarding realized expectancy; it is
+    now capped at neutral for symbols with non-positive expectancy.
+
+Both change SHADOW SCORES. Neither changes a trading decision: mode is
+"shadow", so no score has ever selected a trade. Rank ORDER is also
+unchanged by the weight change - dropping a constant-valued feature is a
+monotone transform of the score - but the absolute scale shifts, because
+total weight falls from 1.00 to 0.95 and the constant +0.025 offset every
+candidate carried is gone.
+
+  CONSEQUENCE, RECORDED NOT RESOLVED: the `tiers` thresholds (0.75 /
+  0.62 / 0.52) were set against the OLD scale. They are only consulted in
+  "active" mode, which is not enabled, so nothing is broken today. They
+  MUST be recalibrated against observed shadow scores before mode is ever
+  set to "active". Recalibrating them now would be guessing at numbers
+  the observation window has not yet produced.
 """
 
 import json
@@ -77,7 +98,7 @@ DEFAULTS = {
         "momentum": 0.10,           # untested by study - shadow-validating
         "signal_tier": 0.10,        # confluence > momentum fallback (structural)
         "history": 0.10,            # gated on min_history_n live-era trades
-        "risk_reward": 0.05,        # neutral proxy until measurable
+        "risk_reward": 0.00,        # S-26: constant 0.5, never measured - see below
         "market_alignment": 0.00,   # contradicted in current window; logged only
     },
     # dynamic trade count by top-candidate confidence (score 0..1).
@@ -165,16 +186,39 @@ def feature_scores(cand, nifty_dir, history):
         s["option_liquidity"] = 0.0
         notes["option_liquidity"] = "no live quote"
 
-    # risk/reward proxy: cheaper premium relative to underlying's day range
-    # means more convexity for the same rupee risk; neutral when unknown
+    # S-26: risk_reward was DOCUMENTED as "cheaper premium relative to the
+    # underlying's day range" but was never computed - it returned the
+    # constant 0.5 for every candidate on every cycle. A constant cannot
+    # separate candidates; all it did was carry 5% of the weight budget and
+    # dilute the three features that ARE measured. Weight is now 0.00, the
+    # same treatment market_alignment already gets: still computed, still
+    # logged, contributing nothing until something real is behind it.
+    # Kept rather than deleted so the breakdown schema is stable.
     s["risk_reward"] = 0.5
-    notes["risk_reward"] = "neutral (proxy)"
+    notes["risk_reward"] = "NOT IMPLEMENTED - constant, weight 0"
 
+    # S-26: this scored win RATE while load_history also computed average
+    # P&L and threw it away. The two are decoupled in this book's realized
+    # data - trailing-stop exits are 21 wins for +Rs.35,079 while initial
+    # stops are 0 wins for -Rs.56,037 - so a symbol can carry a flattering
+    # win rate and still have lost money. Feeding win rate alone into a
+    # feature named "history" asserts an equivalence the ledger contradicts.
+    #
+    # Win rate still drives the score (no P&L->score scale is invented
+    # here; there is no evidence for one). It is now CAPPED AT NEUTRAL when
+    # realized expectancy is non-positive: a symbol that has lost money on
+    # average may not count as evidence in its own favour. Expectancy is
+    # surfaced in the note either way, so the observation window measures
+    # which of the two actually predicts.
     h = history.get(cand["name"]) if history else None
     if h and h["n"] >= h.get("min_n", 10):
         wr = h["win_rate"]
-        s["history"] = clamp01(wr)
-        notes["history"] = f"{h['n']} trades, {wr:.0%} win rate"
+        exp_pnl = h.get("avg_pnl", 0.0)
+        raw = clamp01(wr)
+        s["history"] = min(raw, 0.5) if exp_pnl <= 0 else raw
+        capped = " [capped: negative expectancy]" if exp_pnl <= 0 else ""
+        notes["history"] = (f"{h['n']} trades, {wr:.0%} win rate, "
+                            f"expectancy Rs.{exp_pnl:,.0f}{capped}")
     else:
         s["history"] = 0.5
         n = h["n"] if h else 0
