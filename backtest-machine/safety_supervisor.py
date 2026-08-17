@@ -101,9 +101,19 @@ def daily_realized(conn, book, today):
     table, pnl_col, ts_col = spec
     day = today.isoformat() if isinstance(today, date) else str(today)
     try:
+        # ORDER BY exit_time ALONE is not a total order. The stock book
+        # stamps one timestamp per cycle, so a cycle closing four positions
+        # writes four byte-identical exit_time values - 13 such groups exist
+        # in the live ledger, up to 4 rows each. SQL leaves ties unordered,
+        # and the low-water mark is order-dependent: across the orderings of
+        # one real tied set the mark ranged -2,600 to -1,800, which straddles
+        # the -2,000 limit. Adding rowid makes the replay a total order,
+        # matching insertion order - the true sequence in which those exits
+        # were written. This changes no threshold and no policy; it fixes the
+        # determinism of a SAFETY control.
         rows = conn.execute(
             f"SELECT {pnl_col} FROM {table} "
-            f"WHERE {ts_col} LIKE ? ORDER BY {ts_col}", (f"{day}%",)
+            f"WHERE {ts_col} LIKE ? ORDER BY {ts_col}, rowid", (f"{day}%",)
         ).fetchall()
     except sqlite3.Error:
         return None, None

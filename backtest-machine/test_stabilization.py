@@ -191,48 +191,64 @@ def test_publish_is_idempotent():
 
 
 def test_eod_sync_policy():
-    print("\n[10] K: observability syncs once per session, intraday only")
+    """O-1: observability rides the EXISTING per-cycle state save.
+
+    It was previously EOD_ONLY, which did not delay telemetry - it
+    destroyed it. Runners are ephemeral, so a cycle whose telemetry is not
+    pushed this cycle is gone. Reproduced over a simulated session: 8
+    cycles ran, 2 rows survived.
+    """
+    print("\n[10] K/O-1: observability persists per-cycle, intraday-owned")
     check("observability is monotonic-guarded",
           state_sync.MONOTONIC.get("observability.db"), "cycle")
-    check("classified end-of-session",
-          "observability.db" in state_sync.EOD_ONLY, True)
+    check("EOD_ONLY is now EMPTY", len(state_sync.EOD_ONLY), 0)
+    check("observability is NOT deferred",
+          "observability.db" in state_sync.EOD_ONLY, False)
 
+    # past_square_off is retained (still used by nothing critical) and must
+    # keep reading the square-off time from the authoritative contract.
     class T:
         def __init__(s, h, m): s.hour, s.minute = h, m
     check("13:00 is not end of session", state_sync.past_square_off(T(13, 0)), False)
     check("15:14 is not end of session", state_sync.past_square_off(T(15, 14)), False)
     check("15:15 IS end of session", state_sync.past_square_off(T(15, 15)), True)
-    check("15:30 IS end of session", state_sync.past_square_off(T(15, 30)), True)
 
     iw = (HERE.parent / ".github" / "workflows" / "intraday.yml").read_text()
     pw = (HERE.parent / ".github" / "workflows" / "premarket.yml").read_text()
-    check("intraday saves observability with --eod",
-          "--own observability.db --eod" in iw, True)
+    check("intraday per-cycle save INCLUDES observability.db",
+          "--own intraday_trades.db,simple_trades.db,options_trades.db,"
+          "observability.db" in iw, True)
+    check("no separate --eod step remains", "--eod" in iw, False)
+    check("exactly one state_sync save step in intraday",
+          iw.count("state_sync.py save"), 1)
     check("premarket never saves observability",
           "observability.db" in pw.split("save")[-1], False)
     check("premarket skips it on restore",
           "restore --skip observability.db" in pw, True)
+    check("still exactly one state branch", state_sync.BRANCH, "trading-state")
 
 
-def test_eod_save_is_noop_before_square_off():
-    print("\n[11] K: a pre-square-off EOD save is a silent no-op, not an error")
+def test_eod_flag_is_now_an_inert_noop():
+    """O-1: the --eod path must not be able to push a second time."""
+    print("\n[11] K/O-1: the --eod path is inert, it cannot defer or push")
     import io, contextlib
-    from datetime import datetime as dt
     real = state_sync.past_square_off
     try:
-        state_sync.past_square_off = lambda now=None: False
+        # even AFTER square-off, an --eod save now selects nothing
+        state_sync.past_square_off = lambda now=None: True
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = state_sync.save("observability.db", eod=True)
-        check("returns success", rc, 0)
-        check("says nothing to do yet", "before square-off" in buf.getvalue(), True)
-        # and a normal save must never carry observability along with it
+        check("--eod save returns success", rc, 0)
+        check("--eod save selected nothing to push",
+              "saved observability" in buf.getvalue(), False)
+
+        # and a NORMAL save no longer defers it
         buf2 = io.StringIO()
         with contextlib.redirect_stdout(buf2):
-            rc2 = state_sync.save("observability.db", eod=False)
-        check("normal save defers it", rc2, 0)
-        check("deferral is stated",
-              "deferred to end-of-session" in buf2.getvalue(), True)
+            state_sync.save("observability.db", eod=False)
+        check("normal save no longer defers it",
+              "deferred to end-of-session" in buf2.getvalue(), False)
     finally:
         state_sync.past_square_off = real
 
@@ -245,7 +261,7 @@ if __name__ == "__main__":
                test_gross_net_reconciliation,
                test_books_expose_reconciliation_fields,
                test_publish_is_idempotent, test_eod_sync_policy,
-               test_eod_save_is_noop_before_square_off):
+               test_eod_flag_is_now_an_inert_noop):
         fn()
     print("\n" + "=" * 60)
     if FAILURES:

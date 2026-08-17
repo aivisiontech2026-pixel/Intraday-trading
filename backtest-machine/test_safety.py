@@ -267,6 +267,140 @@ def test_frozen_untouched():
     check("TRAIL_PCT", ot.TRAIL_PCT, 0.12)
 
 
+def test_cash_state_missing_meta_is_silently_recreated():
+    """DIAGNOSTIC ONLY - documents a KNOWN, UNFIXED defect.
+
+    A database can hold complete trade history while meta.cash is absent.
+    Every existing safeguard passes it, and cash() then returns CAPITAL -
+    silently re-basing the book to its starting balance. This is the
+    mechanism that produced the historical Rs.144.05 discrepancy: the
+    2026-08-03 state-loss destroyed the cash row, trades were recovered,
+    and the accumulated Rs.144.05 was not.
+
+    These assertions encode CURRENT behaviour, not desired behaviour. The
+    correction requires a trading-policy decision (halt vs warn vs
+    reconstruct) that has NOT been authorized, so nothing is changed. If a
+    fail-safe is later added, this test MUST fail and be updated
+    deliberately - that is its purpose.
+    """
+    print("\n[20] DIAGNOSTIC: missing meta.cash silently returns CAPITAL")
+    import simple_trader as st
+    import options_trader as ot
+    import state_sync as ss
+
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE trades(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+              "symbol TEXT, qty INTEGER, entry REAL, exit REAL, "
+              "entry_time TEXT, exit_time TEXT, pnl REAL, reason TEXT)")
+    c.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    for i in range(60):
+        c.execute("INSERT INTO trades(symbol,qty,entry,exit,entry_time,"
+                  "exit_time,pnl,reason) VALUES('X',1,100,101,?,?,1.0,'r')",
+                  (f"{TODAY}T09:30:00", f"{TODAY}T15:15:00"))
+    c.commit()
+
+    n = c.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+    has_cash = c.execute("SELECT COUNT(*) FROM meta WHERE key='cash'").fetchone()[0]
+    check("ledger has full history", n, 60)
+    check("meta.cash is ABSENT", has_cash, 0)
+    check("cash() returns CAPITAL, not an error", st.cash(c), 100000.0)
+    check("the same holds for the options book", ot.cash(c), 100000.0)
+
+    # the invariant that IS derivable from existing state
+    check("derivable invariant violated (trades exist, cash absent)",
+          n > 0 and has_cash == 0, True)
+    c.close()
+
+    # and the restore/monotonic guards do not notice
+    import tempfile, os
+    d = tempfile.mkdtemp()
+    p = os.path.join(d, "simple_trades.db")
+    f = sqlite3.connect(p)
+    f.execute("CREATE TABLE trades(id INTEGER PRIMARY KEY, pnl REAL, "
+              "exit_time TEXT)")
+    f.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT)")
+    for _ in range(60):
+        f.execute("INSERT INTO trades(pnl,exit_time) VALUES(1.0,?)",
+                  (f"{TODAY}T15:15:00",))
+    f.commit(); f.close()
+    check("is_valid_db PASSES a cashless database",
+          ss.is_valid_db(p, "trades"), True)
+    check("MONOTONIC guard counts trades, not meta",
+          ss.count_rows(p, "trades"), 60)
+    check("guard table for this book is 'trades'",
+          ss.MONOTONIC["simple_trades.db"], "trades")
+    try:
+        os.remove(p); os.rmdir(d)
+    except OSError:
+        pass
+
+    # the two places a wrong cash value reaches a trading decision
+    src_s = (HERE / "simple_trader.py").read_text(encoding="utf-8")
+    src_o = (HERE / "options_trader.py").read_text(encoding="utf-8")
+    check("stock affordability gate reads cash()",
+          "cash(conn) >= entry_px * qty * 1.0003" in src_s, True)
+    check("options sizing reads cash()",
+          "budget = min(MAX_PER_TRADE, cash(conn))" in src_o, True)
+    check("supervisor does NOT read cash (safety unaffected)",
+          "cash" in (HERE / "safety_supervisor.py").read_text(encoding="utf-8"),
+          False)
+
+
+def test_s04_1_tie_order_is_deterministic():
+    """P0-D F-3: exit_time alone is not a total order.
+
+    The stock book stamps ONE timestamp per cycle, so a cycle closing four
+    positions writes four identical exit_time values - 13 such groups exist
+    in the live ledger. The low-water mark is order-dependent, so an
+    unspecified tie order made a SAFETY decision unspecified.
+    """
+    print("\n[19] S-04-1: identical timestamps replay in insertion order")
+    TS = f"{TODAY}T15:15:50.343539"
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE trades(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+              "pnl REAL, exit_time TEXT)")
+    # insertion order is the true sequence: +500, -1500, -1100, +300
+    for p in (500.0, -1500.0, -1100.0, 300.0):
+        c.execute("INSERT INTO trades(pnl,exit_time) VALUES(?,?)", (p, TS))
+    c.commit()
+    run, low = sup.daily_realized(c, sup.STOCK_BOOK, TODAY)
+    check("running total order-independent", run, -1800.0)
+    check("low-water follows INSERTION order", low, -2100.0)
+
+    # stable across many evaluations
+    seen = {sup.daily_realized(c, sup.STOCK_BOOK, TODAY) for _ in range(300)}
+    check("single distinct result over 300 evaluations", len(seen), 1)
+
+    # an index on exit_time can change the scan plan; the tiebreak must hold
+    c.execute("CREATE INDEX ix_et ON trades(exit_time)")
+    c.commit()
+    run2, low2 = sup.daily_realized(c, sup.STOCK_BOOK, TODAY)
+    check("unchanged after an index on exit_time is added", (run2, low2),
+          (-1800.0, -2100.0))
+
+    # the query must carry an explicit total order
+    src = (HERE / "safety_supervisor.py").read_text(encoding="utf-8")
+    check("ORDER BY carries a rowid tiebreak",
+          "ORDER BY {ts_col}, rowid" in src, True)
+
+    # mixed ties and distinct timestamps still replay chronologically
+    c2 = sqlite3.connect(":memory:")
+    c2.execute("CREATE TABLE trades(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "pnl REAL, exit_time TEXT)")
+    for p, ts in ((100.0, f"{TODAY}T10:00:00"),
+                  (-2500.0, f"{TODAY}T15:15:50"),
+                  (400.0, f"{TODAY}T15:15:50"),
+                  (50.0, f"{TODAY}T15:20:00")):
+        c2.execute("INSERT INTO trades(pnl,exit_time) VALUES(?,?)", (p, ts))
+    c2.commit()
+    r3, l3 = sup.daily_realized(c2, sup.STOCK_BOOK, TODAY)
+    check("mixed ties: running", r3, -1950.0)
+    check("mixed ties: low-water saw the -2,400 trough", l3, -2400.0)
+    check("and that breaches the limit",
+          sup.entry_permission(c2, sup.STOCK_BOOK, TODAY,
+                               LIMIT_CAPITAL, LIMIT_PCT)[0], False)
+
+
 def test_s02_ema_parity():
     print("\n[18] S-02: EMA now adjust=False, matching the backtest")
     src = (HERE / "options_trader.py").read_text(encoding="utf-8")
@@ -295,7 +429,9 @@ if __name__ == "__main__":
                test_r_supervisor_cannot_be_bypassed_by_strategy,
                test_g_halt_does_not_touch_exits,
                test_s05_entry_deps_do_not_gate_risk_management,
-               test_frozen_untouched, test_s02_ema_parity):
+               test_frozen_untouched, test_s02_ema_parity,
+               test_s04_1_tie_order_is_deterministic,
+               test_cash_state_missing_meta_is_silently_recreated):
         fn()
     print("\n" + "=" * 60)
     if FAILURES:

@@ -72,11 +72,32 @@ MONOTONIC = {
 }
 ALL_FILES = list(MONOTONIC)
 
-# Databases that are NOT trading state and follow a different sync policy.
-# observability.db is written every cycle but synchronised ONCE per day,
-# after square-off. Pushing it per cycle would add ~45 commits/hour to the
-# state branch to persist data nothing reads intraday.
-EOD_ONLY = {"observability.db"}
+# Databases deferred to an end-of-session save instead of the per-cycle one.
+#
+# O-1: this is now EMPTY, and observability.db rides the ordinary per-cycle
+# save with the trading books.
+#
+# It previously held observability.db, on the reasoning that a per-cycle
+# push would add ~45 commits/hour. That reasoning was wrong on both halves:
+#
+#   * The push already happens. The intraday workflow saves the three
+#     trading books EVERY cycle - 362 commits landed on trading-state on
+#     2026-08-17 alone. observability.db joins that SAME commit and the
+#     SAME push, so the marginal cost is zero. After square-off it is
+#     strictly cheaper: the old design produced TWO commits per cycle under
+#     one GITHUB_RUN_ID (one for the books, one for observability); now
+#     there is one.
+#
+#   * Deferring did not delay the data, it DESTROYED it. Runners are
+#     ephemeral. A cycle wrote its telemetry to the checkout, the EOD save
+#     declined to push it, and the runner was deleted. Reproduced over a
+#     simulated session: 8 cycles ran, 2 rows survived. Monday retained
+#     only 15:15-15:59 - the trading session itself was lost every day.
+#
+# An empty set keeps the --eod code path harmless rather than removing it:
+# a save requested with --eod now selects nothing and returns success
+# without pushing, so no second observability-only push can occur.
+EOD_ONLY = set()
 
 
 def run(cmd, cwd=None, check=True, quiet=False):

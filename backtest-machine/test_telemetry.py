@@ -13,7 +13,7 @@ import os
 import sqlite3
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -100,6 +100,133 @@ def test_quote_age_null_when_no_feed_time():
     check("exch_feed_time NULL", r[0], None)
     check("received_at still recorded", r[1] is not None, True)
     check("quote_age_s NULL - receive time NOT substituted", r[2], None)
+    c.close()
+
+
+def test_quote_age_parses_broker_timestamp_format():
+    """P0-D F-1: Angel One stamps `17-Aug-2026 15:15:57`, not ISO.
+
+    fromisoformat() alone raises on it, the exception was swallowed, and
+    quote_age_s was NULL on every row of Monday's production run while the
+    raw timestamps were captured correctly.
+    """
+    print("\n[18] broker timestamp format yields a real quote age")
+    check("ISO still parses",
+          tm._parse_ts("2026-08-17T15:15:59.162813").second, 59)
+    check("Angel One format parses",
+          tm._parse_ts("17-Aug-2026 15:15:57").second, 57)
+    check("fromisoformat alone would have failed here",
+          _iso_only("17-Aug-2026 15:15:57"), None)
+    check("garbage still yields None", tm._parse_ts("not a timestamp"), None)
+    check("None yields None", tm._parse_ts(None), None)
+    check("empty string yields None", tm._parse_ts("   "), None)
+
+    fresh()
+    tm.new_cycle()
+    # exactly Monday's observed pair
+    tm.emit_quotes({"9": {"ltp": 5, "bid": 4.9, "ask": 5.1,
+                          "exch_feed_time": "17-Aug-2026 15:15:57"}},
+                   "2026-08-17T15:15:58.000000",
+                   "2026-08-17T15:15:59.162813")
+    c = sqlite3.connect(TMP)
+    r = c.execute("SELECT exch_feed_time,received_at,quote_age_s "
+                  "FROM quote_snapshot").fetchone()
+    check("raw feed time still stored verbatim", r[0], "17-Aug-2026 15:15:57")
+    check("quote_age_s is now COMPUTED", round(r[2], 4), 2.1628)
+    c.close()
+
+    # an unparseable feed time must still leave NULL, never a guess
+    fresh()
+    tm.new_cycle()
+    tm.emit_quotes({"9": {"ltp": 5, "bid": 4.9, "ask": 5.1,
+                          "exch_feed_time": "garbage"}},
+                   "2026-08-17T15:15:58", "2026-08-17T15:15:59")
+    c = sqlite3.connect(TMP)
+    r = c.execute("SELECT exch_feed_time,quote_age_s FROM quote_snapshot").fetchone()
+    check("unparseable feed time stored verbatim", r[0], "garbage")
+    check("age stays NULL - no substitution", r[1], None)
+    c.close()
+
+    # MIXED tz-awareness: both parse, but subtracting raises TypeError. The
+    # broker stamp is naive; simple_trader stamps AWARE times. The failure
+    # must stay LOCAL - losing the whole emit would drop every quote row for
+    # the cycle and every quote_snapshot_id link with it.
+    fresh()
+    tm.new_cycle()
+    res = tm.emit_quotes({"9": {"ltp": 5, "bid": 4.9, "ask": 5.1,
+                                "exch_feed_time": "17-Aug-2026 15:15:57"}},
+                         "2026-08-17T15:15:58+05:30",
+                         "2026-08-17T15:15:59.162813+05:30")
+    check("emit did NOT abort", isinstance(res, dict) and len(res) == 1, True)
+    c = sqlite3.connect(TMP)
+    r = c.execute("SELECT exch_feed_time,received_at,quote_age_s,ltp "
+                  "FROM quote_snapshot").fetchone()
+    check("quote row still inserted", r[3], 5)
+    check("both raw timestamps preserved", (r[0], r[1]),
+          ("17-Aug-2026 15:15:57", "2026-08-17T15:15:59.162813+05:30"))
+    check("age NULL - no offset assumed", r[2], None)
+    c.close()
+
+    # every format the production paths actually emit
+    for label, s, want_tz in (
+            ("broker", "17-Aug-2026 15:15:57", False),
+            ("broker+micros", "17-Aug-2026 15:15:57.123456", False),
+            ("iso naive", "2026-08-17T15:15:59.162813", False),
+            ("iso aware", "2026-08-17T15:15:59.162813+05:30", True),
+            ("space sep", "2026-08-17 15:15:59", False)):
+        d = tm._parse_ts(s)
+        check(f"{label} parses", d is not None, True)
+        check(f"{label} tz-aware={want_tz}", d.tzinfo is not None, want_tz)
+    check("date-only does NOT become a midnight age",
+          tm._parse_ts("17-Aug-2026"), None)
+    check("epoch int rejected", tm._parse_ts(1755432957), None)
+
+
+def _iso_only(s):
+    """What the pre-fix code did, for contrast."""
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def test_candidate_snapshot_has_production_call_site():
+    """P0-D F-2: candidate_snapshot was empty for Monday's entire run."""
+    print("\n[19] emit_candidate is wired to a real production event")
+    src = (HERE / "options_trader.py").read_text(encoding="utf-8")
+    check("emit_candidate called in production",
+          "telemetry.emit_candidate(" in src, True)
+    # it must sit in the ranking-selection block, after position management
+    i_call = src.index("telemetry.emit_candidate(")
+    i_sel = src.index("picks, rejections = ranking.select(")
+    i_exit = src.index("for pos in positions:")
+    check("emitted at the ranking-selection event", i_call > i_sel, True)
+    check("which is after position management", i_sel > i_exit, True)
+    check("no trading branch reads its return value",
+          "= telemetry.emit_candidate(" in src, False)
+
+    # and it records what it is given
+    fresh()
+    tm.new_cycle()
+    cid = tm.emit_candidate(
+        "BANKNIFTY", "BEAR",
+        {"token": "12345", "symbol": "BANKNIFTY25AUG2657300PE",
+         "strike": 57300.0, "expiry": date(2026, 8, 25)},
+        quote_snapshot_id="q1", score=0.61, rank=2, would_trade=1,
+        tier="confluence", today=date(2026, 8, 17))
+    check("returns an id", isinstance(cid, str), True)
+    c = sqlite3.connect(TMP)
+    r = c.execute("SELECT symbol,direction,token,trading_symbol,strike,dte,"
+                  "score,rank,would_trade,tier FROM candidate_snapshot").fetchone()
+    check("symbol", r[0], "BANKNIFTY")
+    check("direction", r[1], "BEAR")
+    check("token", r[2], "12345")
+    check("trading_symbol", r[3], "BANKNIFTY25AUG2657300PE")
+    check("strike", r[4], 57300.0)
+    check("dte derived from expiry - today", r[5], 8)
+    check("score", r[6], 0.61)
+    check("rank", r[7], 2)
+    check("would_trade", r[8], 1)
     c.close()
 
 
@@ -363,7 +490,9 @@ if __name__ == "__main__":
                test_t1_context_restores_on_exception,
                test_t2_no_store_without_explicit_init,
                test_t2_explicit_init_still_works,
-               test_t2_in_memory_store):
+               test_t2_in_memory_store,
+               test_quote_age_parses_broker_timestamp_format,
+               test_candidate_snapshot_has_production_call_site):
         fn()
     tm.shutdown()
     if TMP.exists():

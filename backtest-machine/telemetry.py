@@ -257,6 +257,43 @@ def close_cycle():
     c.commit()
 
 
+def _parse_ts(value):
+    """Best-effort timestamp parse -> datetime, or None.
+
+    Two producers feed the observability store and they do NOT agree on a
+    format:
+
+        our own clock      2026-08-17T15:15:59.162813        (ISO)
+        Angel One feed     17-Aug-2026 15:15:57              (broker format)
+
+    quote_age_s was computed with fromisoformat() alone, which raises on
+    the broker format. The exception was swallowed, so `quote_age_s` was
+    NULL on EVERY row of Monday's production run even though both
+    timestamps were captured correctly - the entire point of the freshness
+    capture produced no measurement.
+
+    Returns None on anything unrecognised, so the caller still records
+    NULL rather than a guessed age. No threshold is applied anywhere; this
+    only makes an already-captured quantity computable.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        pass
+    for fmt in ("%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
+    return None
+
+
 def _bar_status(bar_ts, observed_at):
     """COMPLETED / FORMING / UNKNOWN for the bar the signal was built on.
 
@@ -331,6 +368,11 @@ def emit_quotes(quotes, requested_at, received_at):
     broker supplies no feed time the age is NULL - receive time is not
     substituted, because that would measure our latency and label it market
     staleness.
+
+    The age is DERIVED from two timestamps that are also stored verbatim
+    alongside it, so a parsing change can never invent a value: if either
+    timestamp cannot be read the age stays NULL and the raw strings remain
+    available for offline reconstruction.
     """
     c = _c()
     if c is None or not quotes:
@@ -340,11 +382,21 @@ def emit_quotes(quotes, requested_at, received_at):
         feed = q.get("exch_feed_time")
         age = None
         if feed and received_at:
-            try:
-                age = (datetime.fromisoformat(str(received_at))
-                       - datetime.fromisoformat(str(feed))).total_seconds()
-            except Exception:
-                age = None
+            f, r = _parse_ts(feed), _parse_ts(received_at)
+            if f is not None and r is not None:
+                # The subtraction is guarded SEPARATELY from the parse. Two
+                # datetimes can both parse and still not be subtractable:
+                # the broker stamp is naive while simple_trader stamps
+                # tz-AWARE times, and mixing them raises TypeError. Without
+                # a local guard that escapes to @_safe and aborts the whole
+                # emit - losing every quote row for the cycle plus the
+                # quote_snapshot_id links - which is strictly worse than the
+                # NULL age this replaces. No offset is assumed: an
+                # incomparable pair yields NULL, never a guessed age.
+                try:
+                    age = (r - f).total_seconds()
+                except TypeError:
+                    age = None
         qid = uuid.uuid4().hex
         out[str(token)] = qid
         c.execute("INSERT INTO quote_snapshot(quote_snapshot_id,cycle_id,token,"

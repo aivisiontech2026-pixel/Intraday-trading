@@ -105,25 +105,23 @@ jobs:
           STATE_REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
         run: |
           cd backtest-machine
-          # Owns the three trading books; market_memory.db belongs to the
-          # pre-market workflow and is left untouched, so the two cannot
-          # overwrite each other. state_sync refuses to push a database
-          # with fewer closed trades than the branch already holds.
-          python state_sync.py save --own intraday_trades.db,simple_trades.db,options_trades.db
-
-      - name: Persist observability (end of session only)
-        if: always()
-        env:
-          # Same authoritative URL the trading-state save above uses.
-          # Without it state_sync cannot reach the branch and the step
-          # exits 1 every day after square-off while persisting nothing.
-          STATE_REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-        run: |
-          cd backtest-machine
-          # K: ONE synchronisation per day. A no-op on every cycle before
-          # square-off, so this step is safe to run on all ~45 cycles.
-          # observability.db belongs to THIS workflow only.
-          python state_sync.py save --own observability.db --eod
+          # Owns the three trading books plus observability.db;
+          # market_memory.db belongs to the pre-market workflow and is left
+          # untouched, so the two cannot overwrite each other. state_sync
+          # refuses to push a database with fewer closed trades than the
+          # branch already holds.
+          #
+          # O-1: observability.db is saved HERE, in the existing per-cycle
+          # commit, not in a separate end-of-session step. One commit, one
+          # push, all four files - so this adds no Git traffic and replaces
+          # the second post-close push the old EOD step performed. Deferring
+          # it did not delay telemetry, it destroyed it: the runner is
+          # ephemeral, so anything not pushed this cycle is gone.
+          #
+          # A rejected observability.db (corrupt, or fewer cycle rows than
+          # the branch) is reported and skipped; the trading books in the
+          # same call are still staged, committed and pushed.
+          python state_sync.py save --own intraday_trades.db,simple_trades.db,options_trades.db,observability.db
 
       - name: Publish dashboard (GitHub Pages)
         if: always()

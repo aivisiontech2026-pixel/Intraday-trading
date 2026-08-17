@@ -927,9 +927,19 @@ def process(conn, log, today):
         ranking.log_cycle(conn, rank_mode, ranked, picks)
         pick_names = {c["name"] for c in picks}
         for c in ranked:
+            would = 1 if c["name"] in pick_names else 0
             trace(event="rank", symbol=c["name"], rank=c["rank"],
-                  score=c["score"], tier=c["tier"],
-                  would_trade=1 if c["name"] in pick_names else 0)
+                  score=c["score"], tier=c["tier"], would_trade=would)
+            # Observability: candidate_snapshot had NO production call site,
+            # so the table was empty for Monday's whole run. Every value
+            # below is already computed at this exact point for the trace
+            # above and for ranking.log_cycle(); nothing new is derived and
+            # no decision reads this. Fail-open like every other emitter.
+            telemetry.emit_candidate(
+                c["name"], c["direction"], c["rec"],
+                quote_snapshot_id=_qsnap.get(str(c["rec"]["token"])),
+                score=c["score"], rank=c["rank"], would_trade=would,
+                tier=c.get("tier"), today=today)
         if rank_mode == "active":
             for c, why in rejections:
                 trace(event="rank_rejected", symbol=c["name"],
