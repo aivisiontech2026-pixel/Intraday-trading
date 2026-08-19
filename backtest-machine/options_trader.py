@@ -732,6 +732,31 @@ def process(conn, log, today):
                 consider(name, info, d, "momentum",
                          tag=f" [momentum {info['momentum']:+.1f}%]")
 
+    # Observability: record the ENTRY GATE and every input that produced it.
+    #
+    # Without this a cycle with zero candidate_snapshot rows is ambiguous:
+    # either the gate was CLOSED (no evaluation happened, so production
+    # could not have entered anything) or it was OPEN and the candidate set
+    # was genuinely EMPTY. Those demand opposite treatment in a portfolio
+    # replay - the first means "look forward to the next open cycle", the
+    # second means "no entry was possible here" - and they were
+    # indistinguishable. 17 such cycles on 2026-08-18, 58 on 2026-08-19.
+    #
+    # Every value below was ALREADY computed above for the trading
+    # decision; nothing is evaluated, fetched or derived for telemetry.
+    # The candidate cadence is untouched: this only records what the gate
+    # already decided. Fail-open, return value unused.
+    telemetry.emit_decision(
+        "ENTRY_GATE",
+        reason=(f"in_window={int(in_window)} "
+                f"time={int(T_ENTRY_START <= now_min <= T_ENTRY_END)} "
+                f"fresh={int(signals_fresh)} "
+                f"signals={int(signals_available)} "
+                f"master={int(bool(master))} "
+                f"allowed={int(entry_allowed)} "
+                f"candidates={len(candidates)}"),
+        trading_symbol=safety_supervisor.OPTIONS_BOOK)
+
     # ---- ONE batched live-quote call for positions + candidates --------
     tokens = [p["token"] for p in positions if p.get("token")]
     tokens += [c["rec"]["token"] for c in candidates]

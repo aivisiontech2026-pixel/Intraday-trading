@@ -230,6 +230,59 @@ def test_candidate_snapshot_has_production_call_site():
     c.close()
 
 
+def test_entry_gate_disambiguates_zero_candidate_cycles():
+    """P0-W: a cycle with zero candidate rows was ambiguous.
+
+    Either the gate was CLOSED (candidates were never evaluated, so no
+    entry was possible) or it was OPEN and the set was genuinely EMPTY.
+    Portfolio replay must treat those oppositely. 17 such cycles on
+    2026-08-18, 58 on 2026-08-19.
+    """
+    print("\n[20] ENTRY_GATE records the already-computed gate state")
+    src = (HERE / "options_trader.py").read_text(encoding="utf-8")
+    check("ENTRY_GATE emitted in production", '"ENTRY_GATE"' in src, True)
+    # must fire on EVERY cycle that reaches the gate - not inside `if in_window`
+    i_gate = src.index('"ENTRY_GATE"')
+    i_win = src.index("candidates = []   # dicts")
+    i_quotes = src.index("# ---- ONE batched live-quote call")
+    check("emitted after candidate construction", i_gate > i_win, True)
+    check("emitted before the quote fetch", i_gate < i_quotes, True)
+    # 4-space indent means module-level-of-function, i.e. NOT inside `if in_window`
+    gate_line = [l for l in src.splitlines()
+                 if l.rstrip().endswith('"ENTRY_GATE",')][0]
+    check("emitted at function scope, not inside a conditional block",
+          len(gate_line) - len(gate_line.lstrip()), 8)
+    check("return value unused", "= telemetry.emit_decision" in src, False)
+    # every constituent it records must be a value production already computed
+    for v in ("in_window", "signals_fresh", "signals_available",
+              "entry_allowed", "len(candidates)"):
+        check(f"records already-computed {v}", v in src, True)
+    check("no new evaluation added for telemetry",
+          src.count("if in_window:"), 1)
+
+    # the recorded string must be machine-parseable both ways
+    fresh()
+    tm.new_cycle()
+    tm.emit_decision("ENTRY_GATE", reason="in_window=0 time=1 fresh=1 "
+                     "signals=1 master=1 allowed=0 candidates=0")
+    tm.emit_decision("ENTRY_GATE", reason="in_window=1 time=1 fresh=1 "
+                     "signals=1 master=1 allowed=1 candidates=7")
+    c = sqlite3.connect(TMP)
+    rows = [r[0] for r in c.execute(
+        "SELECT reason FROM decision WHERE action='ENTRY_GATE' ORDER BY rowid")]
+    c.close()
+    check("both rows stored", len(rows), 2)
+    closed = dict(kv.split("=") for kv in rows[0].split())
+    openr = dict(kv.split("=") for kv in rows[1].split())
+    check("closed gate parses", closed["in_window"], "0")
+    check("closed gate names the blocker", closed["allowed"], "0")
+    check("open gate parses", openr["in_window"], "1")
+    check("open gate carries candidate count", openr["candidates"], "7")
+    check("zero candidates + open gate is distinguishable",
+          (closed["in_window"], closed["candidates"]) !=
+          (openr["in_window"], openr["candidates"]), True)
+
+
 def test_bar_status_and_signal_age():
     print("\n[4] completed vs forming bar detection")
     fresh()
@@ -492,7 +545,8 @@ if __name__ == "__main__":
                test_t2_explicit_init_still_works,
                test_t2_in_memory_store,
                test_quote_age_parses_broker_timestamp_format,
-               test_candidate_snapshot_has_production_call_site):
+               test_candidate_snapshot_has_production_call_site,
+               test_entry_gate_disambiguates_zero_candidate_cycles):
         fn()
     tm.shutdown()
     if TMP.exists():
