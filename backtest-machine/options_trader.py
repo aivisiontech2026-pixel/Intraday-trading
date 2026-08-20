@@ -140,6 +140,9 @@ EXPERIMENT_NO_SAME_CYCLE_REENTRY = bool(
 # every cycle. That is what makes sub-5-minute polling worthwhile - the
 # gain is faster stop-loss reaction, not fresher signals.
 SIGNAL_MAX_AGE_SEC = 285    # just under 5 min, so a 5-min bar is never missed
+# S-09: seconds a bar covers, matching telemetry._bar_status. Used only to
+# tell a FORMING bar from a CLOSED one - it is not a cadence.
+BAR_SECONDS = 300
 
 UNIVERSE = [("NIFTY", "^NSEI"), ("BANKNIFTY", "^NSEBANK")] + \
     [(s.replace(".NS", ""), s) for s in CFG.get("symbols", [])]
@@ -307,6 +310,78 @@ def get_direction(df):
     if ema9 < ema21 and last < vwap:
         return "BEAR"
     return None
+
+
+def _final_bar_proven_closed(df, observed_at):
+    """True ONLY when the final bar can be PROVEN complete.
+
+    Returns False for every form of doubt. Never raises.
+
+    A bar stamped T covers [T, T+BAR_SECONDS). Proving it closed needs
+    two unambiguous instants, so both sides are normalised to absolute
+    (tz-aware) time before subtracting:
+
+      bar    yfinance returns tz-AWARE stamps for NSE symbols. A NAIVE
+             index carries no offset, so its instant is unknowable and
+             completion cannot be proven.
+      obs    `_recv_at` is naive local time. `.astimezone()` interprets a
+             naive datetime as local and yields an aware one, so the
+             comparison is in absolute time and no longer depends on the
+             runner's TZ matching the exchange's. Under the previous
+             wall-clock subtraction a UTC runner against IST bars gave
+             age = -19800s, which silently read as "closed".
+    """
+    try:
+        bar_ts = df.index[-1]
+        # NaT (like NaN) is not equal to itself - detects it without
+        # importing pandas here.
+        if bar_ts is None or bar_ts != bar_ts:       # NaT / missing
+            return False
+        bar_ts = bar_ts.to_pydatetime()
+        if bar_ts.tzinfo is None:                    # ambiguous offset
+            return False
+        obs = (datetime.fromisoformat(str(observed_at))
+               if observed_at else datetime.now())
+        obs = obs.astimezone()                       # naive -> local-aware
+        age = (obs - bar_ts).total_seconds()
+    except Exception:
+        return False                                 # unreadable -> unproven
+    if age < 0:                                      # clock skew / future bar
+        return False
+    return age >= BAR_SECONDS
+
+
+def signal_bars(df, observed_at=None):
+    """The bars a signal may legitimately be built on.
+
+    A bar stamped T covers [T, T+BAR_SECONDS). Observed before that
+    window closes it is still FORMING and its OHLC can still change, so
+    a signal built on it can flip on data that had not happened yet.
+    During market hours yfinance returns exactly that bar as the last row
+    and get_direction() reads .iloc[-1].
+
+    COMPLETION-POSITIVE RULE: the final bar is retained ONLY when it is
+    PROVEN closed. Every form of doubt - unreadable timestamp, NaT, naive
+    index, negative age, clock skew, timezone ambiguity - drops it.
+
+    The earlier revision inverted this: it fell back to the untouched
+    frame whenever completion could not be established, so four separate
+    degraded-input paths silently reinstated the very defect this exists
+    to remove, with no error and no telemetry. Dropping instead costs at
+    most one bar of staleness on data that is definitely complete.
+
+    Pure selection on an ALREADY-FETCHED frame: no request, no cadence
+    change, no I/O.
+
+    Empty frame -> returned unchanged (nothing to drop; get_direction and
+    get_trend_quality return None/0.5 on empty, get_momentum returns 0.0,
+    so no caller can be surprised).
+    """
+    if df is None or len(df) == 0:
+        return df
+    if _final_bar_proven_closed(df, observed_at):
+        return df                       # proven complete -> keep it
+    return df.iloc[:-1]                 # unproven or forming -> drop it
 
 
 def get_trend_quality(df):
@@ -624,10 +699,25 @@ def process(conn, log, today):
             if df is None or df.empty:
                 continue
             _recv_at = datetime.now().isoformat(timespec="microseconds")
+            # S-09: yfinance returns the CURRENTLY FORMING bar as the last row
+            # during market hours, and get_direction() reads .iloc[-1]. So
+            # 83.6% of production signals (3,308 of 3,959 recorded) were
+            # built on an incomplete bar whose OHLC can still change.
+            #
+            # `signal_bars` retains the final row ONLY when it is PROVEN
+            # closed; any doubt drops it. Dropping unconditionally instead
+            # would discard valid completed bars and add a bar of staleness -
+            # that variant altered 80 further signals needlessly.
+            #
+            # This uses the SAME dataframe already fetched above. No new
+            # market-data request, no new cadence, no change to batching,
+            # ordering, retries or rate limits. It changes bar SELECTION and
+            # nothing else.
+            _sig_df = signal_bars(df, _recv_at)
             data[name] = {"spot": float(df["Close"].iloc[-1]),
-                          "direction": get_direction(df),
-                          "momentum": get_momentum(df, today),
-                          "trend_quality": get_trend_quality(df)}
+                          "direction": get_direction(_sig_df),
+                          "momentum": get_momentum(_sig_df, today),
+                          "trend_quality": get_trend_quality(_sig_df)}
             # observability: bar identity/status + a COMPLETED-BAR direction
             # recorded for later comparison. Never read back, never used.
             telemetry.emit_signal(
