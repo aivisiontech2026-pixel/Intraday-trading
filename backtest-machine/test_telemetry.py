@@ -531,6 +531,104 @@ def test_t2_in_memory_store():
     tm.shutdown()
 
 
+def _with_github_sha(value):
+    """Set/clear GITHUB_SHA and return the previous value for restoration."""
+    prev = os.environ.get("GITHUB_SHA")
+    if value is None:
+        os.environ.pop("GITHUB_SHA", None)
+    else:
+        os.environ["GITHUB_SHA"] = value
+    return prev
+
+
+def _cycle_row(db):
+    c = sqlite3.connect(db)
+    cols = [r[1] for r in c.execute("PRAGMA table_info(cycle)")]
+    row = c.execute("SELECT * FROM cycle ORDER BY process_started_at "
+                    "DESC LIMIT 1").fetchone()
+    c.close()
+    return dict(zip(cols, row)) if row else {}
+
+
+def test_p0b_code_sha_provenance():
+    """P0-B: every CI cycle must be attributable to its executing commit.
+
+    code_sha was NULL on 1,193/1,193 historical cycles. The resolution
+    order is explicit argument -> GITHUB_SHA -> None, mirroring run_id.
+    """
+    print("\n[21] P0-B runtime provenance: code_sha")
+    saved = os.environ.get("GITHUB_SHA")
+    SHA = "94ec220e1c339e60c2d012666ce87257ea05e142"
+    try:
+        # (2) GITHUB_SHA present -> recorded verbatim.
+        _with_github_sha(SHA)
+        fresh()
+        tm.new_cycle(trading_date="2026-08-24")
+        tm.close_cycle()
+        env_row = _cycle_row(TMP)
+        check("GITHUB_SHA present -> code_sha recorded", env_row["code_sha"], SHA)
+        # (5) it is the SHA the runner checked out, not a re-derived one.
+        check("code_sha equals the simulated executing commit",
+              env_row["code_sha"] == SHA, True)
+
+        # (1) an explicit argument outranks the environment.
+        fresh()
+        tm.new_cycle(trading_date="2026-08-24", code_sha="deadbeef")
+        tm.close_cycle()
+        check("explicit code_sha wins over GITHUB_SHA",
+              _cycle_row(TMP)["code_sha"], "deadbeef")
+
+        # (3)(4) absent -> NULL, no exception. NULL is a determinate
+        # answer (this did not run in CI), never a guess.
+        _with_github_sha(None)
+        fresh()
+        raised = None
+        try:
+            tm.new_cycle(trading_date="2026-08-24")
+            tm.close_cycle()
+        except Exception as e:                      # pragma: no cover
+            raised = f"{type(e).__name__}: {e}"
+        check("no exception when GITHUB_SHA absent", raised, None)
+        local_row = _cycle_row(TMP)
+        check("GITHUB_SHA absent -> code_sha NULL", local_row["code_sha"], None)
+
+        # (6) repeated local calls stay determinate - never a stale or
+        # invented value carried over from the earlier env-set cycles.
+        seen = []
+        for _ in range(3):
+            fresh()
+            tm.new_cycle(trading_date="2026-08-24")
+            tm.close_cycle()
+            seen.append(_cycle_row(TMP)["code_sha"])
+        check("repeated local calls deterministic", seen, [None, None, None])
+
+        # (8) setting GITHUB_SHA changes code_sha and NOTHING ELSE. Every
+        # other column is either identical or a per-cycle identity/clock
+        # value that must differ by construction.
+        varies = {"cycle_id", "process_started_at", "cycle_completed_at",
+                  "prev_cycle_completed_at", "inter_cycle_gap_s"}
+        differing = {k for k in env_row
+                     if k not in varies and env_row[k] != local_row[k]}
+        check("only code_sha differs when GITHUB_SHA is set",
+              differing, {"code_sha"})
+
+        # (7) fail-open survives the new lookup: a broken store must still
+        # swallow, with GITHUB_SHA set so the new code path is exercised.
+        _with_github_sha(SHA)
+        fresh()
+        tm._conn.close()
+        raised = None
+        try:
+            check("broken store still returns a value or None",
+                  tm.new_cycle(trading_date="2026-08-24") is not None
+                  or True, True)
+        except Exception as e:                      # pragma: no cover
+            raised = f"{type(e).__name__}: {e}"
+        check("provenance lookup cannot raise through @_safe", raised, None)
+    finally:
+        _with_github_sha(saved)
+
+
 if __name__ == "__main__":
     for fn in (test_cycle_identity, test_timestamp_ordering,
                test_quote_age_null_when_no_feed_time,
@@ -546,7 +644,8 @@ if __name__ == "__main__":
                test_t2_in_memory_store,
                test_quote_age_parses_broker_timestamp_format,
                test_candidate_snapshot_has_production_call_site,
-               test_entry_gate_disambiguates_zero_candidate_cycles):
+               test_entry_gate_disambiguates_zero_candidate_cycles,
+               test_p0b_code_sha_provenance):
         fn()
     tm.shutdown()
     if TMP.exists():

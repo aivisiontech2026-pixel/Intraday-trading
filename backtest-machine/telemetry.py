@@ -221,6 +221,22 @@ def new_cycle(run_id=None, scheduled_at=None, workflow_started_at=None,
 
     The returned value is a correlation key only. No trading branch reads
     it; if telemetry is disabled it is None and every later emit() no-ops.
+
+    PROVENANCE (P0-B). run_id and code_sha both resolve as:
+
+        explicit argument  OR  GitHub Actions environment  OR  None
+
+    code_sha was NULL on all 1,193 historical cycles - the parameter
+    existed and the column existed, but nothing passed it and, unlike
+    run_id, it had no environment fallback. So the production database
+    could not prove which commit executed any cycle. GITHUB_SHA is the
+    commit the runner checked out, which is exactly the question.
+
+    None is a deterministic answer, not a failure: a local run has no
+    GITHUB_SHA and records NULL, the same way run_id already does. The
+    SHA is never guessed and Git is never read at runtime - a working
+    tree can be dirty or checked out elsewhere, so `git rev-parse HEAD`
+    in this process would not be evidence of what actually ran.
     """
     global _cycle_id
     c = _c()
@@ -242,7 +258,8 @@ def new_cycle(run_id=None, scheduled_at=None, workflow_started_at=None,
               "VALUES(?,?,?,?,?,?,?,?,?,?)",
               (_cycle_id, run_id or os.environ.get("GITHUB_RUN_ID"),
                trading_date, scheduled_at, workflow_started_at, started,
-               prev_done, gap, experiment_flags, code_sha))
+               prev_done, gap, experiment_flags,
+               code_sha or os.environ.get("GITHUB_SHA")))
     c.commit()
     return _cycle_id
 
