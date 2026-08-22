@@ -56,6 +56,25 @@ SCRIP_MASTER_URL = ("https://margincalculator.angelone.in/OpenAPI_File/files/"
                     "OpenAPIScripMaster.json")
 SCRIP_CACHE = HERE / "scripmaster_cache.json"
 SCRIP_CACHE_MAX_AGE_H = 20  # refreshed daily by Angel One; re-pull each day
+# S-34a: TOTAL budget for one instrument-master refresh, covering connect,
+# TLS, response wait and body download. See _fetch_master for why a plain
+# requests timeout cannot express this and for the exact bound claimed.
+SCRIP_REFRESH_BUDGET_S = 20
+# Ceiling on any single socket operation. The actual value passed to
+# requests is derived from the REMAINING budget, so it can only ever be
+# smaller than this. It also fixes the worst-case overshoot: a stall that
+# begins just after a deadline check can run one socket timeout long.
+SCRIP_REFRESH_SOCKET_CAP_S = 5
+# Body is consumed in chunks THIS size, and the deadline is re-checked
+# between them - so the chunk size IS the checking granularity. It must
+# stay small: iter_content blocks until a whole chunk has accumulated, so
+# a 1 MB chunk on a degraded link can block for a long time before the
+# first check ever runs. That was measured: with a 1 MB chunk the bound
+# did not hold at all against a real trickling socket. At 32 KB the check
+# fires roughly every 32 KB / bandwidth - well under a second even on a
+# badly degraded link - and the ~1,200 iterations needed for a 37 MB
+# payload cost nothing measurable.
+SCRIP_REFRESH_CHUNK_B = 32 * 1024
 # S-33: how old a cached master may be and still be served as a FALLBACK
 # after a refresh has failed. This is NOT the refresh interval above - a
 # cache older than SCRIP_CACHE_MAX_AGE_H is still re-downloaded first, and
@@ -145,6 +164,93 @@ def _cache_age_h():
 def _cache_is_fresh():
     age_h = _cache_age_h()
     return age_h is not None and age_h < SCRIP_CACHE_MAX_AGE_H
+
+
+class MasterRefreshTimeout(Exception):
+    """The refresh exceeded its total budget. Subclasses Exception so the
+    existing handler in load_instrument_master routes it to S-33 exactly
+    like any other refresh failure."""
+
+
+def _fetch_master(url, budget_s=None, now=None, session_factory=None):
+    """Download and parse the instrument master within a TOTAL budget.
+
+    WHY NOT requests.get(timeout=N)
+    -------------------------------
+    `timeout` is a per-socket-operation timeout: connect, then the gap
+    BETWEEN reads. It says nothing about total elapsed time. A body
+    delivered as a slow but steady trickle never exceeds the inter-byte
+    gap, so the call runs as long as the server wants. Measured in a
+    controlled local experiment: a body streamed in 20 chunks 0.8s apart
+    completed in 16.0s against timeout=2 - an 8x overshoot. That is the
+    mechanism behind the 219.5s cycle observed on 2026-08-21 against a
+    180s setting, and it is why the socket timeout is a floor on the
+    failure cost, not a ceiling.
+
+    Redirects compound it further: each hop is granted a FRESH timeout, so
+    the total is the sum over hops. `allow_redirects=False` removes that
+    entirely - this URL serves 200 directly, and a redirect appearing in
+    future is treated as a refresh failure, which fails closed into S-33.
+
+    THE BOUND THIS ACTUALLY CLAIMS
+    ------------------------------
+    Not an exact wall-clock guarantee. The deadline is monotonic and is
+    checked between chunks, so a stall starting just after a check runs
+    for at most one socket timeout before the read itself gives up:
+
+        total <= budget + SCRIP_REFRESH_SOCKET_CAP_S + parse
+
+    with parse measured at ~0.2s for a 37 MB payload. An exact bound would
+    need a watchdog thread or signal-based interruption, both larger than
+    this change. The bound above is what the tests assert.
+
+    The deadline is checked BETWEEN chunks, so SCRIP_REFRESH_CHUNK_B is
+    the granularity of enforcement, not a performance knob. A body
+    smaller than one chunk yields a single blocking read, bounded then
+    only by the socket timeout - acceptable here because the real payload
+    is ~37 MB, i.e. ~1,200 chunks.
+
+    monotonic, not wall clock: immune to NTP steps and DST. `now` and
+    `session_factory` are injectable so the deadline can be exercised
+    deterministically without a network or a real clock.
+    """
+    budget_s = SCRIP_REFRESH_BUDGET_S if budget_s is None else budget_s
+    now = now or time.monotonic
+    deadline = now() + budget_s
+
+    def remaining():
+        return deadline - now()
+
+    def socket_timeout():
+        # Derived from what is LEFT, never more than the cap.
+        return max(0.1, min(SCRIP_REFRESH_SOCKET_CAP_S, remaining()))
+
+    session = (session_factory or requests.Session)()
+    try:
+        if remaining() <= 0:
+            raise MasterRefreshTimeout(
+                f"budget {budget_s}s exhausted before the request began")
+        t = socket_timeout()
+        resp = session.get(url, timeout=(t, t), stream=True,
+                           allow_redirects=False)
+        resp.raise_for_status()          # 4xx/5xx
+        if resp.status_code != 200:      # 3xx: no redirect is followed
+            raise MasterRefreshTimeout(
+                f"unexpected status {resp.status_code} (redirects disabled)")
+        buf = bytearray()
+        for chunk in resp.iter_content(chunk_size=SCRIP_REFRESH_CHUNK_B):
+            if remaining() <= 0:
+                raise MasterRefreshTimeout(
+                    f"total budget {budget_s}s exceeded after "
+                    f"{len(buf):,} bytes")
+            if chunk:
+                buf.extend(chunk)
+        return json.loads(bytes(buf))
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 def _read_cache():
@@ -313,10 +419,9 @@ def load_instrument_master(universe=None):
 
     # 2. REFRESH.
     try:
-        print("  Instrument master: downloading (~35 MB)...")
-        resp = requests.get(SCRIP_MASTER_URL, timeout=180)
-        resp.raise_for_status()
-        raw = resp.json()
+        print(f"  Instrument master: downloading (~35 MB, "
+              f"{SCRIP_REFRESH_BUDGET_S}s budget)...")
+        raw = _fetch_master(SCRIP_MASTER_URL)
         print(f"  Instrument master: downloaded {len(raw):,} records")
         out, reason = _index_master(raw, universe)
         if not out:

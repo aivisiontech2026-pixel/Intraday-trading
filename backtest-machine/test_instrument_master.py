@@ -73,8 +73,15 @@ def write_cache(payload, age_h=0.0):
 def reset(download=None):
     """Fresh module state with the cache pointed at a scratch file.
 
-    `download` is called instead of requests.get: None means 'no injection
+    `download` is the injected refresh payload: None means 'no injection
     configured' and raises, which is the download-failure case.
+
+    TRANSPORT FAKE (S-34a compatibility). The fake speaks the streaming
+    interface the loader now uses - Session / stream=True /
+    allow_redirects=False / status_code / iter_content - instead of the
+    older get()+json() shape. Same payloads, same failure behaviour, same
+    attempt counting, so every scenario below exercises exactly what it
+    exercised before. No assertion changed; only the shape of the mock.
     """
     angel._MASTER_CACHE = None
     angel._MASTER_HEALTH.update(status="UNKNOWN", age_h=None, reason=None)
@@ -85,6 +92,7 @@ def reset(download=None):
     class _Resp:
         def __init__(self, payload):
             self._p = payload
+            self.status_code = 200
 
         def raise_for_status(self):
             pass
@@ -92,13 +100,26 @@ def reset(download=None):
         def json(self):
             return self._p
 
-    def _get(url, timeout=None):
+        def iter_content(self, chunk_size=None):
+            body = json.dumps(self._p).encode("utf-8")
+            step = chunk_size or len(body) or 1
+            for i in range(0, len(body), step):
+                yield body[i:i + step]
+
+    def _get(url, timeout=None, stream=None, allow_redirects=None):
         calls["n"] += 1
         if download is None:
             raise ConnectionError("injected: refresh unavailable")
         return _Resp(download)
 
-    angel.requests = type("R", (), {"get": staticmethod(_get)})
+    class _Session:
+        get = staticmethod(_get)
+
+        def close(self):
+            pass
+
+    angel.requests = type("R", (), {"get": staticmethod(_get),
+                                    "Session": _Session})
     return calls
 
 
