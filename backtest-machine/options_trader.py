@@ -62,6 +62,7 @@ import json
 import math
 import sqlite3
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -230,6 +231,88 @@ def meta_get(conn, key, default=None):
 
 def meta_set(conn, key, value):
     conn.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, str(value)))
+
+
+# ------------------------------------------- S-34b refresh throttle ---
+# S-34a bounds how LONG one instrument-master refresh may block. It does
+# not change how OFTEN one is attempted, and while the cache is stale
+# every cycle attempts another: on 2026-08-21 that was 208 attempts
+# across 208 cycles, 89 of which failed, for 129.6 minutes of blocked
+# time in a single session. Position management sits downstream of the
+# master load, so every one of those seconds delayed stop evaluation.
+#
+# S-33 already made frequent refresh unnecessary for CORRECTNESS: a
+# validated cache up to 72h old is authorized to trade. So after a
+# failure it is safe to wait before trying again.
+#
+# THE THROTTLE IS AN OPTIMIZATION, NEVER A SAFETY AUTHORITY. Every way
+# of failing to read it - absent, empty, malformed, future-dated,
+# unreadable database - permits the refresh. Bad state can only ever
+# cause one extra bounded attempt; trusting bad state could suppress an
+# attempt that was needed.
+MASTER_REFRESH_RETRY_S = 30 * 60
+MASTER_REFRESH_KEY = "master_refresh_failed_at"
+
+
+def master_refresh_allowed(conn, now_epoch=None):
+    """May a network refresh be attempted this cycle?
+
+    Epoch seconds, deliberately the same clock basis as the cache mtime
+    S-33 measures age with, so the two are directly comparable and
+    neither depends on the runner's timezone.
+
+    Returns True on every anomaly. `now_epoch` is injectable so the
+    boundary can be tested without wall-clock timing.
+    """
+    now_epoch = time.time() if now_epoch is None else now_epoch
+    try:
+        raw = meta_get(conn, MASTER_REFRESH_KEY)
+    except Exception as e:                      # database unreadable
+        print(f"  Master refresh throttle: state unreadable "
+              f"({type(e).__name__}) - allowing refresh")
+        return True
+    if raw is None or str(raw).strip() == "":
+        return True                             # never failed, or cleared
+    try:
+        failed_at = float(raw)
+    except (TypeError, ValueError):
+        print("  Master refresh throttle: state malformed - allowing refresh")
+        return True
+    elapsed = now_epoch - failed_at
+    if elapsed < 0:
+        # Future timestamp: a backwards clock step, or state written by a
+        # runner whose clock ran ahead. Waiting it out could suppress
+        # refreshes for an unbounded time, so it is treated as no state.
+        print("  Master refresh throttle: timestamp is in the future "
+              "- allowing refresh")
+        return True
+    return elapsed >= MASTER_REFRESH_RETRY_S
+
+
+def record_master_refresh(conn, health, now_epoch=None):
+    """Persist throttle state from how the loader actually resolved.
+
+    A THROTTLED SKIP must never stamp the timestamp. If it did, the
+    interval would restart on every cycle and the suppression would
+    extend itself indefinitely - which is why this keys off
+    `refresh_attempted` rather than off the status alone.
+
+    Persistence failure is swallowed: the throttle must never become a
+    new way for trading to break.
+    """
+    if not health.get("refresh_attempted"):
+        return                                  # skipped: leave state alone
+    try:
+        if health.get("status") == "OK":
+            meta_set(conn, MASTER_REFRESH_KEY, "")          # cleared
+        else:
+            # Includes a download that succeeded but validated as
+            # unusable - no new master was obtained, so it is a failure.
+            meta_set(conn, MASTER_REFRESH_KEY,
+                     time.time() if now_epoch is None else now_epoch)
+    except Exception as e:
+        print(f"  Master refresh throttle: state not persisted "
+              f"({type(e).__name__}) - trading unaffected")
 
 
 def cash(conn):
@@ -673,7 +756,13 @@ def process(conn, log, today):
     # entirely - so a data outage could leave a position past its stop
     # with live quotes available and unused. It no longer gates exits;
     # it only disables NEW candidate construction below.
-    master = angel.load_instrument_master(UNIVERSE_NAMES)
+    # S-34b: skip a network attempt when one failed recently. The loader
+    # honours this ONLY after proving a usable <=72h fallback exists, so
+    # it cannot suppress a refresh the system actually needs.
+    _refresh_ok = master_refresh_allowed(conn)
+    master = angel.load_instrument_master(UNIVERSE_NAMES,
+                                          refresh_allowed=_refresh_ok)
+    record_master_refresh(conn, angel.master_health())
     if not master:
         print("  Instrument master unavailable -> no NEW option trades "
               "(existing positions ARE still risk-managed this cycle).")

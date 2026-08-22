@@ -128,23 +128,30 @@ _MASTER_CACHE = None   # in-process memo: {name: [option records]}
 # S-33: how the master was obtained this process. Diagnostic only - no
 # trading branch reads it. `status` is one of OK / STALE / DOWN / CORRUPT /
 # EMPTY / MISSING / UNIVERSE_MISMATCH / STALE_EXPIRED / UNKNOWN.
-_MASTER_HEALTH = {"status": "UNKNOWN", "age_h": None, "reason": None}
+_MASTER_HEALTH = {"status": "UNKNOWN", "age_h": None, "reason": None,
+                  # S-34b: did this process actually make a network attempt?
+                  # The caller needs this to decide whether to stamp its
+                  # throttle timestamp - a THROTTLED SKIP must never stamp
+                  # it, or the interval restarts every cycle and the
+                  # suppression becomes self-extending.
+                  "refresh_attempted": False}
 
 
 def master_health():
     """Copy of how the instrument master resolved this process.
 
-    Exposed so a caller can record it. Nothing reads it today: wiring it
-    into telemetry would mean editing options_trader.py, which is outside
-    the authorized surface for S-33, so the classification is also printed
-    to stdout - the channel this module already uses and the one the
-    workflow captures in run_output.txt and the Actions log.
+    Read by options_trader (S-34b) to maintain the refresh throttle, and
+    printed to stdout - the channel this module already uses and the one
+    the workflow captures in run_output.txt and the Actions log. It is
+    diagnostic and scheduling state only: no trading branch reads it, and
+    it can neither serve a master nor suppress one on its own.
     """
     return dict(_MASTER_HEALTH)
 
 
-def _set_health(status, age_h=None, reason=None):
-    _MASTER_HEALTH.update(status=status, age_h=age_h, reason=reason)
+def _set_health(status, age_h=None, reason=None, attempted=False):
+    _MASTER_HEALTH.update(status=status, age_h=age_h, reason=reason,
+                          refresh_attempted=bool(attempted))
 
 
 def _cache_age_h():
@@ -347,7 +354,7 @@ def _index_master(raw, universe):
     return out, None
 
 
-def load_instrument_master(universe=None):
+def load_instrument_master(universe=None, refresh_allowed=True):
     """Download (or reuse a <20h cache of) the instrument master and index
     the NFO option contracts we care about.
 
@@ -417,6 +424,42 @@ def load_instrument_master(universe=None):
         # recoverable by downloading, and that stays true.
         print(f"  Instrument master: cached copy unusable ({why}) - refreshing")
 
+    # 1b. S-34b REFRESH THROTTLE.
+    #
+    # `refresh_allowed=False` means the caller knows a refresh failed
+    # recently. It is a request to SKIP a network attempt - never a
+    # licence to serve data S-33 would refuse.
+    #
+    # STRUCTURAL BYPASS. The throttle is honoured ONLY after a usable
+    # fallback has actually been proven, by running the same S-33 checks
+    # the failure path runs. So there is no state in which throttling can
+    # serve an expired, missing, corrupt, empty or universe-invalid
+    # master: in every one of those the validation below fails, the block
+    # falls through, and the refresh happens anyway. That is why this is
+    # expressed as "prove, then skip" rather than "skip, then hope" - a
+    # guard that can be forgotten is not a guarantee.
+    #
+    # Cost of proving it is a parse and index of the local file, measured
+    # at ~0.44s for a 37 MB payload, against a refresh this exists to
+    # avoid. The 72h bound is read from the same mtime S-33 uses, so the
+    # throttle cannot extend it by even a second.
+    if not refresh_allowed:
+        age_h = _cache_age_h()
+        if age_h is not None and age_h <= SCRIP_CACHE_MAX_STALE_H:
+            raw, why = _read_cache()
+            if raw is not None:
+                out, reason = _index_master(raw, universe)
+                if out:
+                    _MASTER_CACHE = out
+                    _set_health("STALE", age_h, "refresh throttled")
+                    print(f"  Instrument master: refresh THROTTLED - serving "
+                          f"validated cache ({age_h:.1f}h old, within "
+                          f"{SCRIP_CACHE_MAX_STALE_H}h): "
+                          f"{sum(len(v) for v in out.values()):,} option "
+                          f"contracts across {len(out)} underlyings")
+                    return out
+        print("  Instrument master: throttle BYPASSED - no usable fallback")
+
     # 2. REFRESH.
     try:
         print(f"  Instrument master: downloading (~35 MB, "
@@ -429,14 +472,15 @@ def load_instrument_master(universe=None):
             # a good cache with this would destroy the fallback.
             print(f"  Instrument master: downloaded copy REJECTED ({reason})")
             _MASTER_CACHE = out
-            _set_health(reason, 0.0, "download validated as unusable")
+            _set_health(reason, 0.0, "download validated as unusable",
+                        attempted=True)
             return out
         try:
             SCRIP_CACHE.write_text(json.dumps(raw), encoding="utf-8")
         except Exception:
             pass  # cache write is best-effort
         _MASTER_CACHE = out
-        _set_health("OK", 0.0)
+        _set_health("OK", 0.0, attempted=True)
         print(f"  Instrument master: indexed "
               f"{sum(len(v) for v in out.values()):,} option contracts "
               f"across {len(out)} underlyings")
@@ -453,25 +497,25 @@ def load_instrument_master(universe=None):
     age_h = _cache_age_h()
     if age_h is None:
         print("  Instrument master: no local cache to fall back on")
-        _set_health("MISSING", reason=dl_err)
+        _set_health("MISSING", reason=dl_err, attempted=True)
         return {}
     if age_h > SCRIP_CACHE_MAX_STALE_H:
         print(f"  Instrument master: cache is {age_h:.1f}h old, beyond the "
               f"{SCRIP_CACHE_MAX_STALE_H}h fallback bound - NOT used")
-        _set_health("STALE_EXPIRED", age_h, dl_err)
+        _set_health("STALE_EXPIRED", age_h, dl_err, attempted=True)
         return {}
     raw, why = _read_cache()
     if raw is None:
         print(f"  Instrument master: cache unusable ({why}) - no master")
-        _set_health(why, age_h, dl_err)
+        _set_health(why, age_h, dl_err, attempted=True)
         return {}
     out, reason = _index_master(raw, universe)
     if not out:
         print(f"  Instrument master: cache unusable ({reason}) - no master")
-        _set_health(reason, age_h, dl_err)
+        _set_health(reason, age_h, dl_err, attempted=True)
         return {}
     _MASTER_CACHE = out
-    _set_health("STALE", age_h, dl_err)
+    _set_health("STALE", age_h, dl_err, attempted=True)
     print(f"  Instrument master: refresh failed - using STALE cache "
           f"({age_h:.1f}h old, within {SCRIP_CACHE_MAX_STALE_H}h): "
           f"{sum(len(v) for v in out.values()):,} option contracts "
