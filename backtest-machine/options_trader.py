@@ -78,6 +78,11 @@ import safety_supervisor
 # Observability only (P0-E). Every call is fail-open and returns a value
 # no trading branch reads. See telemetry.py's architectural contract.
 import telemetry
+# Wednesday 2026-08-26 stabilization gates (ENTRY-ONLY), the gate ledger,
+# the U-014 trail floor and the reporting-only cost model. Every rule is
+# configurable and reversible from intraday_config.json without a code
+# revert. See stabilization.py's header for the exit-path invariant.
+import stabilization as stab
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -106,6 +111,38 @@ INTERVAL = CONTRACT.interval                # "5m"
 MIN_DAILY_TRADES = 5
 MAX_POSITIONS = CONTRACT.max_positions      # 4 x Rs.25,000 = full book
 FALLBACK_START_MIN = 11 * 60
+
+# --- Wednesday 2026-08-26 stabilization policy ------------------------------
+# TEMPORARY, CONFIGURABLE, REVERSIBLE. `"stabilization": {"enabled": false}`
+# in intraday_config.json restores baseline behaviour exactly, with no code
+# revert, and the ledger then records that the gates were off.
+STAB = stab.get_config(CFG)
+STAB_ON = bool(STAB["enabled"])
+
+# CHANGE 6: concurrent option positions, capped for stabilization.
+#
+# Deliberately a SEPARATE configuration key from `max_open_positions`.
+# That key is ALSO read by paper_trader.py:94 and intraday_backtest.py:68,
+# so lowering it would change the STOCK book too - out of scope per the
+# authorization. `max_option_positions` is options-only and defaults to 2.
+#
+# It is NOT claimed to be the optimal position count. Measured in-sample,
+# a 2-position cap removed only ~4% of the 09:31 damage (-Rs.22,269 vs
+# -Rs.23,123): position count is risk CONTAINMENT, and the stale-signal
+# gate below is the independent data-validity fix.
+MAX_OPTION_POSITIONS = (int(STAB["max_option_positions"]) if STAB_ON
+                        else MAX_POSITIONS)
+
+# CHANGE 11: end-of-day gate summary, sent once at/after this minute even
+# when the session produced no trade at all.
+T_GATE_SUMMARY = 15 * 60 + 35
+
+# CHANGE 3 / CHANGE 15: how long after an exit the price path is followed,
+# and how far apart the observations may be. Post-exit observation is
+# PASSIVE - the tokens ride the quote batch that already runs every cycle,
+# so it adds no market-data request.
+POST_EXIT_WINDOW_MIN = 60
+POST_EXIT_KEY = "post_exit_watch"
 T_ENTRY_START, T_ENTRY_END = CONTRACT.entry_start, CONTRACT.entry_end
 
 # EXPERIMENT (default OFF): same-cycle candidate-reuse guard.
@@ -467,6 +504,36 @@ def signal_bars(df, observed_at=None):
     return df.iloc[:-1]                 # unproven or forming -> drop it
 
 
+def _signal_bar_meta(df, sig_df, observed_at, today_str):
+    """Bar identity for the freshness gate. Never raises; unknown -> None.
+
+    Pure inspection of an ALREADY-FETCHED frame: no request, no cadence
+    change, no I/O. A field that cannot be read stays None, and None is a
+    REJECTION at the gate - never a pass.
+    """
+    meta = {"bar_ts": None, "used_bar_ts": None,
+            "observed_at": str(observed_at) if observed_at else None,
+            "bar_age_s": None, "session_status": "UNKNOWN"}
+    try:
+        if df is not None and len(df):
+            meta["bar_ts"] = str(df.index[-1])
+    except Exception:
+        meta["bar_ts"] = None
+    try:
+        if sig_df is not None and len(sig_df):
+            meta["used_bar_ts"] = str(sig_df.index[-1])
+    except Exception:
+        meta["used_bar_ts"] = None
+    meta["bar_age_s"] = stab.bar_age_s(meta["bar_ts"], meta["observed_at"])
+    # Same rule as telemetry.emit_signal, so the gate verdict and the
+    # recorded session_status can never disagree.
+    if meta["bar_ts"]:
+        meta["session_status"] = ("VALID"
+                                  if str(meta["bar_ts"])[:10] == str(today_str)
+                                  else "STALE_OR_AMBIGUOUS")
+    return meta
+
+
 def get_trend_quality(df):
     """Fraction of the last 12 bars whose EMA9/21 relationship matches the
     current one. NOTE (evidence): the 60d study found FRESH trends
@@ -514,7 +581,8 @@ def trace(**fields):
 
 # ----------------------------------------------------------------- orders ---
 def open_option(conn, rec, quote, spot, underlying_dir, today, log,
-                fair, tag="", score=None, rank_pos=None, tier=None):
+                fair, tag="", score=None, rank_pos=None, tier=None,
+                candidate_id=None):
     """Open a position. Entry fills at the live ASK (crossing the spread),
     falling back to live LTP when there is no depth. Never a model price.
     The candidate's ranking-engine score/rank/tier and the full entry
@@ -570,10 +638,14 @@ def open_option(conn, rec, quote, spot, underlying_dir, today, log,
           rank=rank_pos if rank_pos is not None else "n/a", tier=tier or "n/a",
           price_source="LIVE_ASK" if ask > 0 else "LIVE_LTP")
 
-    # observability: entry decision with full contract identity
+    # observability: entry decision with full contract identity.
+    # CHANGE 9: `candidate_id` closes the chain
+    #   cycle -> candidate -> gates -> selection -> decision -> trade.
+    # It was NULL on all 34 historical ENTRY rows.
     telemetry.emit_decision(
-        "ENTRY", reason=underlying_dir, token=rec.get("token"),
-        trading_symbol=rec.get("symbol"), entry_price=entry_px, qty=qty)
+        "ENTRY", reason=underlying_dir, candidate_id=candidate_id,
+        token=rec.get("token"), trading_symbol=rec.get("symbol"),
+        entry_price=entry_px, qty=qty)
 
     msg = (f"📊 OPTIONS: BOUGHT {lots} lot(s) ({qty}) {rec['symbol']} "
            f"@ Rs.{entry_px:.2f}{tag} | cost Rs.{cost:,.0f} | "
@@ -583,8 +655,107 @@ def open_option(conn, rec, quote, spot, underlying_dir, today, log,
     return True
 
 
+DAY_GATES_KEY = "gate_ledger_day"
+DAY_HEARTBEAT_KEY = "cycle_heartbeat_count"
+
+
+def _record_day_gates(conn, today_str, ledger):
+    """Accumulate the session's gate totals and heartbeat count.
+
+    Kept in `meta` (which already rides the per-cycle state push) so the
+    15:35 summary survives the ephemeral runner without a second store.
+    """
+    try:
+        raw = meta_get(conn, f"{DAY_GATES_KEY}:{today_str}")
+        acc = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        acc = {}
+    for k, v in ledger.as_dict().items():
+        acc[k] = int(acc.get(k, 0)) + int(v)
+    acc["cycles"] = int(acc.get("cycles", 0)) + 1
+    meta_set(conn, f"{DAY_GATES_KEY}:{today_str}", json.dumps(acc))
+    return acc
+
+
+def _eod_gate_summary(conn, today_str, now_min, log):
+    """CHANGE 11: ONE Telegram message at 15:35 with the day's gate ledger
+    and heartbeat count - sent whether or not any trade occurred.
+
+    Section 22: a zero-trade session must be POSITIVELY CONFIRMED. Silence
+    is indistinguishable from a crash, an auth failure, a failed state
+    restore, a scheduler that never fired, or a gate rejecting everything
+    because the GATE is broken.
+    """
+    if now_min < T_GATE_SUMMARY:
+        return
+    flag = f"gate_summary_sent:{today_str}"
+    if meta_get(conn, flag):
+        return
+    try:
+        raw = meta_get(conn, f"{DAY_GATES_KEY}:{today_str}")
+        acc = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        acc = {}
+    gen = int(acc.get("candidates_generated", 0))
+    rej = sum(int(acc.get(b, 0)) for b in stab.REJECT_BUCKETS)
+    passed = int(acc.get("passed_to_selection", 0))
+    entered = int(acc.get("entered", 0))
+    ok = (gen == rej + passed) and entered <= passed
+    lines = [f"🧾 OPTIONS GATE SUMMARY | {today_str}",
+             f"cycles (heartbeats): {int(acc.get('cycles', 0))}",
+             f"candidates generated: {gen}"]
+    for b in stab.REJECT_BUCKETS:
+        n = int(acc.get(b, 0))
+        if n:
+            lines.append(f"  {b.replace('rejected_', 'rejected ')}: {n}")
+    lines += [f"passed to selection: {passed}", f"entered: {entered}",
+              f"identities hold: {'YES' if ok else 'NO'}",
+              f"gates: {'ON' if STAB_ON else 'OFF'} "
+              f"(max_pos={MAX_OPTION_POSITIONS}, min_dte={STAB['min_dte']}, "
+              f"max_spread={STAB['max_entry_spread_pct']}%, "
+              f"max_bar_age={STAB['max_signal_bar_age_s']}s)"]
+    msg = "\n".join(lines)
+    log.append(msg)
+    telegram(msg)
+    meta_set(conn, flag, "1")
+
+
+def _watch_minutes(w, now):
+    """Minutes since a watched contract was closed, or None if unreadable."""
+    try:
+        t = datetime.fromisoformat(str(w.get("exited_at")))
+        n = now.replace(tzinfo=None) if now.tzinfo else now
+        if t.tzinfo:
+            t = t.replace(tzinfo=None)
+        m = (n - t).total_seconds() / 60.0
+        return m if m >= 0 else None
+    except Exception:
+        return None
+
+
+def post_exit_watchlist(conn):
+    """Contracts whose price path is still being followed after an exit."""
+    try:
+        return json.loads(meta_get(conn, POST_EXIT_KEY) or "[]")
+    except (ValueError, TypeError):
+        return []
+
+
+def post_exit_watch(conn, entry):
+    """CHANGE 3: start following a contract after it is closed.
+
+    PASSIVE. The token joins the quote batch that already runs every
+    cycle, so no additional market-data request is made and no cadence
+    changes. Persisted in `meta` because the runner is ephemeral.
+    """
+    lst = [w for w in post_exit_watchlist(conn)
+           if str(w.get("token")) != str(entry.get("token"))]
+    lst.append(entry)
+    meta_set(conn, POST_EXIT_KEY, json.dumps(lst[-32:]))
+
+
 def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None,
-                 peak_source=None):
+                 peak_source=None, spot=None, underlying_dir=None):
     """Close a position.
 
     `exit_px` is normally the live market price. For stop-triggered exits
@@ -638,10 +809,53 @@ def close_option(conn, pos, exit_px, reason, log, quote=None, price_source=None,
 
     # observability: exit decision + the high-water mark that produced it.
     # Captured here because the options_positions row is deleted above.
+    #
+    # CHANGE 15 - TREND REVERSAL: INSTRUMENT, DO NOT CHANGE.
+    # 12 trend-reversal exits, 0 winners, -Rs.23,147 on the full book.
+    # Concerning, but not proof of causality - so the exit rule is
+    # UNTOUCHED and the missing evidence is recorded instead: how far the
+    # premium still was from its INITIAL stop when the reversal fired, and
+    # what the underlying was doing at that instant. Combined with the
+    # post-exit path below, that makes the decision answerable next week
+    # without changing anything today.
+    _initial_stop = (pos["entry_price"] * (1 + INITIAL_STOP_PCT)
+                     if pos.get("entry_price") else None)
     telemetry.emit_exit(
         pos.get("token"), pos.get("trading_symbol"), reason,
         exit_price=exit_px, high_water_at_exit=pos.get("high_water"),
-        peak_source=peak_source, pnl=pnl)
+        peak_source=peak_source, pnl=pnl,
+        entry_price=pos.get("entry_price"), initial_stop_level=_initial_stop,
+        underlying_spot=spot, underlying_direction=underlying_dir)
+
+    # CHANGE 10 - REAL TRANSACTION COST ACCOUNTING (REPORTING ONLY).
+    # The options book has always reported Costs = Rs.0. Gross P&L above is
+    # unchanged and no historical row is rewritten; the modeled cost and
+    # the net figure are recorded ALONGSIDE it. Nothing in execution,
+    # stops, trail arming, ranking or selection reads this.
+    try:
+        _costs = stab.round_trip_cost(pos["entry_price"], exit_px, qty)
+        _fric = stab.spread_friction(pos.get("entry_bid"), pos.get("entry_ask"),
+                                     (quote or {}).get("bid"),
+                                     (quote or {}).get("ask"), qty)
+        telemetry.emit_trade_cost(
+            pos.get("token"), pos.get("trading_symbol"), qty,
+            pos["entry_price"], exit_px, pnl, _costs, friction=_fric,
+            rate_source=stab.COST_RATE_SOURCE)
+    except Exception as e:                       # accounting must never trade
+        print(f"  cost accounting skipped ({type(e).__name__}: {e})")
+
+    # CHANGE 3 - POST-EXIT PATH. The table had ZERO rows, so an
+    # initial-stop exit could never be classified as "correct", "too
+    # tight", "option noise" or "wrong direction". Registering the
+    # contract here starts a 60-minute passive observation.
+    try:
+        post_exit_watch(conn, {
+            "token": str(pos.get("token")), "symbol": pos.get("trading_symbol"),
+            "exited_at": datetime.now().isoformat(timespec="seconds"),
+            "exit_price": exit_px, "entry_price": pos.get("entry_price"),
+            "reason": reason, "underlying": pos.get("symbol")})
+    except Exception as e:
+        print(f"  post-exit watch skipped ({type(e).__name__}: {e})")
 
     emoji = "✅" if pnl > 0 else "❌"
     msg = (f"{emoji} OPTIONS: SOLD {pos.get('lots')} lot(s) ({qty}) "
@@ -728,12 +942,58 @@ def process(conn, log, today):
 
     now = datetime.now().astimezone()
     now_min = now.hour * 60 + now.minute
+    # Naive wall clock, matching how telemetry normalises bar stamps, so
+    # the freshness gate measures the same age the evidence records.
+    now_iso = now.replace(tzinfo=None).isoformat(timespec="microseconds")
 
     # --- observability: open a correlation cycle (additive, fail-open) ---
     telemetry.new_cycle(
         trading_date=today_str,
         experiment_flags=("no_same_cycle_reentry="
-                          f"{EXPERIMENT_NO_SAME_CYCLE_REENTRY}"))
+                          f"{EXPERIMENT_NO_SAME_CYCLE_REENTRY}"
+                          f" stabilization={STAB_ON}"))
+
+    # CHANGE 11: every generated candidate gets exactly one terminal
+    # disposition, so a zero-trade cycle is POSITIVELY explained instead of
+    # being inferred from an empty candidate list. Created here, before the
+    # first early return, so EVERY cycle emits a ledger and a heartbeat -
+    # including the degraded ones. A missing heartbeat is then a genuine
+    # failure signal rather than an artefact of which branch we took.
+    ledger = stab.GateLedger(MAX_OPTION_POSITIONS if STAB_ON else None)
+    hb = {"trading_date": today_str, "state_restored": None, "auth_ok": None,
+          "master_ok": None, "signals_ok": None, "quotes_fetched": None,
+          "gates_evaluated": False, "entry_window": None,
+          "open_positions": None}
+
+    def finish(note=None):
+        """Close the cycle: heartbeat + gate ledger + EOD summary + commit.
+
+        Called on EVERY exit path from process(), degraded ones included.
+        Fail-open throughout - observability may never prevent a commit.
+        """
+        try:
+            ok = True
+            try:
+                ledger.check()
+            except stab.LedgerIdentityError as e:
+                ok = False
+                print(f"  GATE LEDGER IDENTITY VIOLATED: {e}")
+                trace(event="gate_ledger_identity_violated", detail=str(e))
+            hb["candidates_generated"] = ledger.candidates_generated
+            if hb.get("open_positions") is None:
+                hb["open_positions"] = conn.execute(
+                    "SELECT COUNT(*) FROM options_positions").fetchone()[0]
+            telemetry.emit_heartbeat(note=note, **hb)
+            telemetry.emit_gate_ledger(ledger, trading_date=today_str,
+                                       identities_ok=ok,
+                                       detail=ledger.summary())
+            print(f"  GATE LEDGER: {ledger.summary()} identities_ok={ok}")
+            _record_day_gates(conn, today_str, ledger)
+            _eod_gate_summary(conn, today_str, now_min, log)
+        except Exception as e:
+            print(f"  cycle close-out observability skipped "
+                  f"({type(e).__name__}: {e})")
+        conn.commit()
 
     # ---- live market data plumbing -------------------------------------
     # NOTE: every early return below MUST first run the square-off net.
@@ -747,7 +1007,8 @@ def process(conn, log, today):
               "(execution requires live quotes; synthetic pricing is not "
               "permitted).")
         square_off_net(conn, log, now_min, "Angel One unavailable")
-        conn.commit()
+        hb["auth_ok"] = False
+        finish("angel_one_unavailable")
         return
     # S-05 RISK-MANAGEMENT ISOLATION.
     # The instrument master is an ENTRY-side dependency: open positions
@@ -763,6 +1024,9 @@ def process(conn, log, today):
     master = angel.load_instrument_master(UNIVERSE_NAMES,
                                           refresh_allowed=_refresh_ok)
     record_master_refresh(conn, angel.master_health())
+    hb["auth_ok"] = True
+    hb["state_restored"] = True   # db_init() opened a restored book above
+    hb["master_ok"] = bool(master)
     if not master:
         print("  Instrument master unavailable -> no NEW option trades "
               "(existing positions ARE still risk-managed this cycle).")
@@ -807,6 +1071,23 @@ def process(conn, log, today):
                           "direction": get_direction(_sig_df),
                           "momentum": get_momentum(_sig_df, today),
                           "trend_quality": get_trend_quality(_sig_df)}
+            # CHANGE 1: carry the bar identity forward so the freshness
+            # gate can be evaluated WITHOUT refetching anything.
+            #
+            #   bar_ts        latest observed bar - the same quantity
+            #                 telemetry.bar_age_s and session_status are
+            #                 already computed from, so gate and evidence
+            #                 cannot disagree.
+            #   used_bar_ts   the bar the DIRECTION was actually built on
+            #                 (last proven-closed bar). On 2026-08-24 the
+            #                 09:15:55 observation carried Friday 15:25 in
+            #                 BOTH fields, direction BULL, session_status
+            #                 STALE_OR_AMBIGUOUS - and nothing in the
+            #                 engine read any of it.
+            #
+            # These are strings, so they survive the JSON signal cache.
+            data[name].update(_signal_bar_meta(df, _sig_df, _recv_at,
+                                               today_str))
             # observability: bar identity/status + a COMPLETED-BAR direction
             # recorded for later comparison. Never read back, never used.
             telemetry.emit_signal(
@@ -827,6 +1108,7 @@ def process(conn, log, today):
     # entirely - the single highest-severity coupling the audit found.
     # It now disables NEW candidate construction and nothing else.
     signals_available = "NIFTY" in data
+    hb["signals_ok"] = bool(signals_available)
     if not signals_available:
         print("  No underlying data -> no NEW option trades this cycle "
               "(existing positions ARE still risk-managed).")
@@ -875,17 +1157,81 @@ def process(conn, log, today):
     in_window = (T_ENTRY_START <= now_min <= T_ENTRY_END
                  and signals_fresh and signals_available and bool(master)
                  and entry_allowed)
+    hb["entry_window"] = bool(in_window)
+    hb["gates_evaluated"] = True
 
     candidates = []   # dicts: name/rec/direction/tier/tag + score features
+    # Symbols dropped by a gate. Section 3.2: a rejection must DROP the
+    # candidate, never substitute. The confluence pass and the momentum
+    # fallback pass both consult this, so a symbol rejected by a gate in
+    # the first pass cannot be re-admitted with a different direction in
+    # the second - which would be "selecting a different option on the
+    # same underlying" by side effect.
+    gate_rejected = set()
     if in_window:
         def consider(name, info, direction, tier, tag=""):
+            """Build at most ONE candidate for `name`, or drop it.
+
+            Section 3.2 - NO SUBSTITUTION. `nearest_expiry()` and
+            `find_option()` are each called exactly once. There is no
+            retry loop, no expiry rollover, no strike walk, and no
+            relaxation of any threshold. Every failure path below ends in
+            `return` with nothing appended.
+            """
+            ledger.generated()
+
+            # CHANGE 1 - signal / session validity, BEFORE any contract
+            # work. Cheapest gate first, and it drops the symbol for both
+            # passes rather than just this one.
+            if STAB_ON:
+                r = stab.check_signal_freshness(info, today, STAB, now=now_iso)
+                if not r:
+                    ledger.reject(r.reason)
+                    gate_rejected.add(name)
+                    trace(event="entry_skipped", symbol=name, reason=r.reason,
+                          bar_ts=info.get("bar_ts"),
+                          used_bar_ts=info.get("used_bar_ts"),
+                          bar_age_s=info.get("bar_age_s"),
+                          session_status=info.get("session_status"),
+                          threshold_s=STAB["max_signal_bar_age_s"],
+                          trading_date=today_str, gate="signal_freshness")
+                    telemetry.emit_candidate(
+                        name, direction, {}, today=today,
+                        gate_result="REJECTED", gate_reason=r.reason,
+                        selection_policy=stab.POLICY_NAME,
+                        signal_bar_ts=info.get("bar_ts"),
+                        signal_bar_age_s=info.get("bar_age_s"))
+                    return
+
             exp = angel.nearest_expiry(master, name, today, min_dte=1)
             if exp is None:
+                ledger.reject("no_listed_expiry")
+                gate_rejected.add(name)
                 trace(event="entry_skipped", symbol=name, reason="no_listed_expiry")
                 return
+
+            # CHANGE 2 - temporary DTE floor. A rejection DROPS the
+            # candidate: `nearest_expiry` is NOT called again with a later
+            # date, so no expiry rollover can occur.
+            if STAB_ON:
+                r = stab.check_dte(exp, today, STAB)
+                if not r:
+                    ledger.reject(r.reason)
+                    gate_rejected.add(name)
+                    trace(event="entry_skipped", symbol=name, reason=r.reason,
+                          expiry=exp.isoformat(), min_dte=STAB["min_dte"],
+                          policy="temporary_stabilization_policy", gate="dte")
+                    telemetry.emit_candidate(
+                        name, direction, {"expiry": exp}, today=today,
+                        gate_result="REJECTED", gate_reason=r.reason,
+                        selection_policy=stab.POLICY_NAME)
+                    return
+
             opt_type = "CE" if direction == "BULL" else "PE"
             rec = angel.find_option(master, name, exp, info["spot"], opt_type)
             if rec is None:
+                ledger.reject("no_listed_strike")
+                gate_rejected.add(name)
                 trace(event="entry_skipped", symbol=name, reason="no_listed_strike")
                 return
             candidates.append({
@@ -905,7 +1251,10 @@ def process(conn, log, today):
             picked = {c["name"] for c in candidates}
             for name, info in sorted(data.items(),
                                      key=lambda kv: -abs(kv[1]["momentum"])):
-                if name in traded_today or name in picked:
+                # `gate_rejected` is what stops a gate rejection from
+                # turning into a substitution - see section 3.2.
+                if (name in traded_today or name in picked
+                        or name in gate_rejected):
                     continue
                 d = "BULL" if info["momentum"] >= 0 else "BEAR"
                 consider(name, info, d, "momentum",
@@ -939,12 +1288,37 @@ def process(conn, log, today):
     # ---- ONE batched live-quote call for positions + candidates --------
     tokens = [p["token"] for p in positions if p.get("token")]
     tokens += [c["rec"]["token"] for c in candidates]
+    # CHANGE 3: contracts still inside their 60-minute post-exit window
+    # ride the SAME batch. Purely passive - no extra request, no cadence
+    # change, and nothing here can affect a trading decision.
+    _watch = [w for w in post_exit_watchlist(conn)
+              if _watch_minutes(w, now) is not None
+              and _watch_minutes(w, now) <= POST_EXIT_WINDOW_MIN]
+    tokens += [str(w["token"]) for w in _watch if w.get("token")]
     _q_req_at = datetime.now().isoformat(timespec="microseconds")
     quotes = angel.get_quotes(smart, list(dict.fromkeys(tokens)))
     _q_recv_at = datetime.now().isoformat(timespec="microseconds")
     print(f"  Live quotes: {len(quotes)}/{len(set(tokens))} tokens fetched")
+    hb["quotes_fetched"] = len(quotes)
     # observability: one snapshot per token, keyed for correlation
     _qsnap = telemetry.emit_quotes(quotes, _q_req_at, _q_recv_at) or {}
+
+    # CHANGE 3: record one post-exit observation per watched contract.
+    # Maximum recovery, minimum adverse move, time-to-recovery and
+    # "recovered above entry" are exact aggregates over these rows - no
+    # separate telemetry framework is needed to answer them.
+    for w in _watch:
+        wq = quotes.get(str(w.get("token")))
+        if wq is None:
+            continue
+        telemetry.emit_post_exit(
+            w.get("token"), w.get("symbol"), w.get("exited_at"), wq,
+            quote_snapshot_id=_qsnap.get(str(w.get("token"))),
+            minutes_since_exit=_watch_minutes(w, now),
+            exit_price=w.get("exit_price"), entry_price=w.get("entry_price"),
+            underlying_spot=(data.get(w.get("underlying")) or {}).get("spot"),
+            exit_reason=w.get("reason"))
+    meta_set(conn, POST_EXIT_KEY, json.dumps(_watch))
 
     # ---- ranking engine: SCORING ---------------------------------------
     # In "shadow" (default) this ONLY logs and stamps scores - the
@@ -952,15 +1326,31 @@ def process(conn, log, today):
     # Scores depend only on the candidate and its quote, so they are
     # computed here, next to the quote fetch. SELECTION is deliberately
     # deferred until after position management (see S-25 below).
-    rcfg = ranking.get_config(CFG)
-    rank_mode = rcfg.get("mode", "shadow")
+    #
+    # CHANGE 12 / U-001: ranking is RESEARCH. An exception raised inside
+    # it must not terminate the trader, because the position-management
+    # loop - every stop, every trailing stop, every square-off - runs
+    # BELOW this point. Containment here keeps the exit path reachable
+    # when ranking is broken. The calculation itself is untouched.
+    rcfg, rank_mode = {}, "off"
     ranked, picks, rejections = [], [], []
-    if candidates and rank_mode != "off":
-        for c in candidates:
-            c["quote"] = quotes.get(c["rec"]["token"])
-        history = ranking.load_history(conn, rcfg["min_history_n"])
-        ranked = ranking.rank(candidates, data["NIFTY"]["direction"],
-                              rcfg, history)
+    try:
+        rcfg = ranking.get_config(CFG)
+        rank_mode = rcfg.get("mode", "shadow")
+        if candidates and rank_mode != "off":
+            for c in candidates:
+                c["quote"] = quotes.get(c["rec"]["token"])
+            history = ranking.load_history(conn, rcfg["min_history_n"])
+            ranked = ranking.rank(candidates, data["NIFTY"]["direction"],
+                                  rcfg, history)
+    except Exception as e:
+        ranked, picks, rejections = [], [], []
+        print(f"  RANKING FAILED ({type(e).__name__}: {e}) - scores "
+              f"unavailable this cycle. Exits, stops and square-off are "
+              f"UNAFFECTED; entries fall back to the explicit production "
+              f"selection policy.")
+        trace(event="ranking_exception", error=type(e).__name__,
+              contained="yes", exits_affected="no")
 
     # ---- manage open positions on LIVE prices --------------------------
     for pos in positions:
@@ -1021,8 +1411,29 @@ def process(conn, log, today):
             peak_source = "INTRA_INTERVAL_HIGH"
 
         stop_price = pos["stop_price"] or pos["entry_price"] * (1 + INITIAL_STOP_PCT)
-        if high_water >= pos["entry_price"] * (1 + TRAIL_ACTIVATE_PCT):
-            stop_price = max(stop_price, high_water * (1 - TRAIL_PCT))
+        # CHANGE 4 - U-014 TRAILING DEAD ZONE.
+        #
+        # The trail band (12%) is WIDER than the arm threshold (10%), so an
+        # armed trail computed 1.10 * 0.88 = 0.968 of entry - a stop 3.2%
+        # BELOW the entry price. 17 of 53 live-price trailing exits closed
+        # inside that band for -Rs.6,358, and the worst (-3.168%) landed
+        # within 0.001 of the arithmetic floor. That is an arithmetic
+        # defect, not a strategy preference.
+        #
+        # The fix is a FLOOR at entry + round-trip cost. The arm threshold
+        # and the band are UNCHANGED, so every trail that already sat above
+        # entry produces the identical level; only the mathematically
+        # impossible region is removed. `trail_stop_level` returns None
+        # when the trail is not armed, and the initial stop then stands
+        # exactly as before.
+        _trail = (stab.trail_stop_level(pos["entry_price"], high_water,
+                                        TRAIL_ACTIVATE_PCT, TRAIL_PCT, STAB)
+                  if STAB_ON else
+                  (high_water * (1 - TRAIL_PCT)
+                   if high_water >= pos["entry_price"] * (1 + TRAIL_ACTIVATE_PCT)
+                   else None))
+        if _trail is not None:
+            stop_price = max(stop_price, _trail)
 
         # A new session LOW below the stop means the premium traded through
         # the stop between polls - a resting order would already have
@@ -1088,16 +1499,24 @@ def process(conn, log, today):
             close_option(conn, pos, stop_price,
                          "Trailing stop" if trailing else "Initial stop",
                          log, q, price_source="STOP_LEVEL",
-                         peak_source=peak_source)
+                         peak_source=peak_source,
+                         spot=(info or {}).get("spot"),
+                         underlying_dir=direction)
         elif reversed_:
             close_option(conn, pos, mark, "Trend reversal exit", log, q,
-                         peak_source=peak_source)
+                         peak_source=peak_source,
+                         spot=(info or {}).get("spot"),
+                         underlying_dir=direction)
         elif expiry < today:
             close_option(conn, pos, mark, "Expired contract", log, q,
-                         peak_source=peak_source)
+                         peak_source=peak_source,
+                         spot=(info or {}).get("spot"),
+                         underlying_dir=direction)
         elif now_min >= T_SQUARE_OFF:
             close_option(conn, pos, mark, "Square-off 15:15", log, q,
-                         peak_source=peak_source)
+                         peak_source=peak_source,
+                         spot=(info or {}).get("spot"),
+                         underlying_dir=direction)
 
     # ---- ranking engine: SELECTION (S-25) ------------------------------
     # Selection runs HERE, after the position-management loop, because
@@ -1119,38 +1538,65 @@ def process(conn, log, today):
     # in the cycle, as the live path - removes the divergence. Scores and
     # rank order are computed above and are unaffected; only the
     # capacity-dependent `would_trade` flag changes.
+    #
+    # CHANGE 12 / U-001: contained for the same reason as scoring above -
+    # the selection call is RESEARCH in shadow mode, and an exception here
+    # must not terminate the trader or bypass any risk control.
+    pick_names = set()
     if ranked:
-        open_rows = conn.execute(
-            "SELECT symbol FROM options_positions").fetchall()
-        open_sectors = {}
-        for (sym,) in open_rows:
-            sec = ranking.SECTOR.get(sym, "Other")
-            open_sectors[sec] = open_sectors.get(sec, 0) + 1
-        slots = max(0, MAX_POSITIONS - len(open_rows))
-        picks, rejections = ranking.select(ranked, rcfg, open_sectors, slots)
-        ranking.log_cycle(conn, rank_mode, ranked, picks)
-        pick_names = {c["name"] for c in picks}
-        for c in ranked:
-            would = 1 if c["name"] in pick_names else 0
-            trace(event="rank", symbol=c["name"], rank=c["rank"],
-                  score=c["score"], tier=c["tier"], would_trade=would)
-            # Observability: candidate_snapshot had NO production call site,
-            # so the table was empty for Monday's whole run. Every value
-            # below is already computed at this exact point for the trace
-            # above and for ranking.log_cycle(); nothing new is derived and
-            # no decision reads this. Fail-open like every other emitter.
-            telemetry.emit_candidate(
-                c["name"], c["direction"], c["rec"],
-                quote_snapshot_id=_qsnap.get(str(c["rec"]["token"])),
-                score=c["score"], rank=c["rank"], would_trade=would,
-                tier=c.get("tier"), today=today)
-        if rank_mode == "active":
-            for c, why in rejections:
-                trace(event="rank_rejected", symbol=c["name"],
-                      score=c["score"], reason=why)
+        try:
+            open_rows = conn.execute(
+                "SELECT symbol FROM options_positions").fetchall()
+            open_sectors = {}
+            for (sym,) in open_rows:
+                sec = ranking.SECTOR.get(sym, "Other")
+                open_sectors[sec] = open_sectors.get(sec, 0) + 1
+            # Shadow capacity must match LIVE capacity or the shadow
+            # evidence measures a book the production path cannot open.
+            slots = max(0, MAX_OPTION_POSITIONS - len(open_rows))
+            picks, rejections = ranking.select(ranked, rcfg, open_sectors,
+                                               slots)
+            ranking.log_cycle(conn, rank_mode, ranked, picks)
+            pick_names = {c["name"] for c in picks}
+            for c in ranked:
+                trace(event="rank", symbol=c["name"], rank=c["rank"],
+                      score=c["score"], tier=c["tier"],
+                      would_trade=1 if c["name"] in pick_names else 0)
+            if rank_mode == "active":
+                for c, why in rejections:
+                    trace(event="rank_rejected", symbol=c["name"],
+                          score=c["score"], reason=why)
+        except Exception as e:
+            picks, rejections, pick_names = [], [], set()
+            print(f"  RANKING SELECTION FAILED ({type(e).__name__}: {e}) - "
+                  f"contained. Exits and risk controls UNAFFECTED.")
+            trace(event="ranking_exception", stage="select",
+                  error=type(e).__name__, contained="yes", exits_affected="no")
+
+    # ---- CHANGE 9 / S-41: candidate -> trade traceability --------------
+    # candidate_snapshot was written ONLY for candidates that reached
+    # ranking, and `decision.candidate_id` was NULL on all 34 production
+    # ENTRY rows - candidate linkage was effectively 0%. Every surviving
+    # candidate now gets a row here, before any entry can be attempted, and
+    # its id is carried into the ENTRY decision. Gate-rejected candidates
+    # were already recorded at the point of rejection.
+    _score_by_name = {c["name"]: c for c in ranked}
+    cand_ids = {}
+    for c in candidates:
+        sc = _score_by_name.get(c["name"], {})
+        cand_ids[c["name"]] = telemetry.emit_candidate(
+            c["name"], c["direction"], c["rec"],
+            quote_snapshot_id=_qsnap.get(str(c["rec"]["token"])),
+            score=sc.get("score"), rank=sc.get("rank"),
+            would_trade=1 if c["name"] in pick_names else 0,
+            tier=c.get("tier"), today=today,
+            gate_result="ELIGIBLE", selection_policy=stab.POLICY_NAME,
+            spread_pct=stab.spread_pct(quotes.get(c["rec"]["token"])),
+            signal_bar_ts=(data.get(c["name"]) or {}).get("bar_ts"),
+            signal_bar_age_s=(data.get(c["name"]) or {}).get("bar_age_s"))
 
     if not in_window:
-        conn.commit()
+        finish("entry_window_closed")
         return
 
     # ---- EXPERIMENT: do not refill a slot from a PRE-EXIT candidate list -
@@ -1176,7 +1622,9 @@ def process(conn, log, today):
                   reason="same_cycle_exit_invalidates_candidates",
                   closed_this_cycle=closed_this_cycle,
                   candidates_discarded=len(candidates))
-            conn.commit()
+            for _c in candidates:
+                ledger.reject("other_same_cycle_reentry_guard")
+            finish("same_cycle_reentry_guard")
             return
 
     # ---- entries, on LIVE quotes only ----------------------------------
@@ -1184,24 +1632,95 @@ def process(conn, log, today):
     # with the candidate's score stamped on the trade for attribution.
     open_count = conn.execute(
         "SELECT COUNT(*) FROM options_positions").fetchone()[0]
+
+    # ---- S-44 / CHANGE 9: EXPLICIT PRODUCTION SELECTION STAGE ----------
+    #
+    # Production selection used to be the unnamed `else` branch of the
+    # ranking-mode test, so "which candidates may consume the slots" was
+    # decided by the ORDER OF `symbols` IN intraday_config.json and was
+    # never named, logged, or testable. That is S-44.
+    #
+    # The policy is now explicit, named (`universe_order_v1`), logged on
+    # every candidate row, and unit-tested - and it is DELIBERATELY THE
+    # SAME POLICY. The historical counterfactual measured ranking top-N at
+    # 26.9% win / -5.23% mean (n=78) against universe order at 46.8% /
+    # +0.13% (n=111), so swapping it in today would be an unvalidated
+    # strategy change wearing a bug fix's clothes. Ranking stays SHADOW.
     if rank_mode == "active" and ranked:
         entry_list = picks
+        _not_picked = [c for c in candidates if c["name"] not in pick_names]
+        for _c in _not_picked:
+            ledger.reject("not_selected_ranking_active")
     else:
         entry_list = candidates
+
+    slots = max(0, MAX_OPTION_POSITIONS - open_count)
+    selected, dropped = stab.select_for_entry(entry_list, slots)
+    for _c, _why in dropped:
+        ledger.reject(_why)
+        trace(event="entry_rejected", symbol=_c["rec"]["symbol"],
+              reason=_why, slots=slots, open_positions=open_count,
+              policy=stab.POLICY_NAME)
+    trace(event="selection", policy=stab.POLICY_NAME, mode=rank_mode,
+          eligible=len(entry_list), slots=slots, selected=len(selected))
+
     score_by_name = {c["name"]: c for c in ranked}
 
     iv_cache = {}
-    for cand in entry_list:
+    for cand in selected:
         name, rec = cand["name"], cand["rec"]
-        if open_count >= MAX_POSITIONS:
-            break
-        if name in traded_today:
-            continue
         q = quotes.get(rec["token"])
+
+        # ---- CHANGE 7: FINAL EXECUTION-TIME SAFETY AUTHORIZATION -------
+        #
+        # ENTRY INTENT ONLY. `stab.authorize` returns PASS for any other
+        # intent before reading a single input, and no exit path in this
+        # file calls it at all - the position-management loop above ran to
+        # completion before this point and reads only `positions` and
+        # `quotes`, and square_off_net() is outside even that. An entry
+        # gate therefore cannot block, delay or reject an exit.
+        #
+        # Every value is re-read AT THIS INSTANT rather than trusted from
+        # candidate-selection time: `open_positions` comes from the
+        # database (so exits earlier in this cycle are reflected), the
+        # clock is re-checked, the supervisor verdict, the duplicate set,
+        # the signal, the DTE and the live quote are all re-evaluated.
+        _open_now = conn.execute(
+            "SELECT COUNT(*) FROM options_positions").fetchone()[0]
+        auth = stab.authorize(stab.ENTRY, {
+            "symbol": name,
+            "signal": data.get(name),
+            "trading_date": today,
+            "now": now_iso,
+            "expiry": rec["expiry"],
+            "quote": q,
+            "open_positions": _open_now,
+            "traded_today": traded_today,
+            "entry_allowed": entry_allowed,
+            "in_entry_window": T_ENTRY_START <= now_min <= T_ENTRY_END,
+        }, CFG)
+        if not auth:
+            ledger.reject(auth.reason)
+            trace(event="entry_rejected", symbol=rec["symbol"],
+                  token=rec["token"], reason=auth.reason, gate="final_auth",
+                  open_positions=_open_now, max_positions=MAX_OPTION_POSITIONS,
+                  spread_pct=(f"{stab.spread_pct(q):.3f}"
+                              if stab.spread_pct(q) is not None else "n/a"))
+            telemetry.emit_decision(
+                "ENTRY_REJECTED", reason=auth.reason,
+                candidate_id=cand_ids.get(name), token=rec.get("token"),
+                trading_symbol=rec.get("symbol"))
+            continue
+
+        # Baseline quote guard, retained so behaviour is unchanged when
+        # the stabilization gates are configured OFF.
         if q is None or q["ltp"] <= 0:
+            ledger.reject("quote_no_ltp")
             trace(event="entry_rejected", symbol=rec["symbol"],
                   token=rec["token"], reason="no_live_quote")
             continue
+
+        ledger.passed()
 
         # analytics only - fair value / mispricing edge, never the fill
         key = (name, rec["expiry"])
@@ -1213,11 +1732,13 @@ def process(conn, log, today):
         if open_option(conn, rec, q, data[name]["spot"], cand["direction"],
                        today, log, fair, cand.get("tag", ""),
                        score=sc.get("score"), rank_pos=sc.get("rank"),
-                       tier=cand.get("tier")):
+                       tier=cand.get("tier"),
+                       candidate_id=cand_ids.get(name)):
             traded_today.add(name)
             open_count += 1
+            ledger.entry()
 
-    conn.commit()
+    finish("entry_evaluation_complete")
 
 
 # ----------------------------------------------------------------- main ---

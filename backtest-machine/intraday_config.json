@@ -80,5 +80,14 @@
   "experiments": {
     "_comment": "Controlled experiments. Absent or false = baseline behaviour. no_same_cycle_reentry: when a position is actually closed during a process() cycle, end that cycle's entry evaluation instead of refilling the freed slot from the candidate list built BEFORE the exit. Not a time-based cooldown. Authorized for the 2026-08-14 session only; revert to false afterwards unless separately extended.",
     "no_same_cycle_reentry": true
+  },
+  "stabilization": {
+    "_comment": "TEMPORARY STABILIZATION POLICY for the 2026-08-26 session. Every value is a reversible risk control or data-validity threshold, NOT an optimized strategy parameter. Set enabled=false to restore baseline behaviour exactly, with no code revert. See stabilization.py.",
+    "enabled": true,
+    "max_signal_bar_age_s": 400,
+    "min_dte": 2,
+    "max_entry_spread_pct": 1.0,
+    "max_option_positions": 2,
+    "trail_min_exit_pct": 0.06
   }
 }

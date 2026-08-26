@@ -1,0 +1,91 @@
+name: Pre-open Smoke Test (dry run, entries disabled)
+
+# SECTION 34 of the Wednesday 2026-08-26 stabilization package.
+#
+# Runs ONE full trading cycle against LIVE data with entries disabled, then
+# reports the section-34 checklist. Fifteen changes landed across the
+# safety-critical path at once, and a green unit-test suite does not
+# establish that the process BOOTS in the production environment.
+#
+# WHY THIS IS SAFE TO RUN DURING MARKET HOURS
+#   * OPTIONS_DRY_RUN=1 makes stabilization.authorize() refuse every ENTRY
+#     at the final authorization. Exits are NOT disabled - authorize()
+#     returns PASS for any non-ENTRY intent before the flag is read - so a
+#     position that happens to be open is still risk-managed.
+#   * State is NOT pushed. There is no `state_sync.py save` step, so the
+#     run cannot advance trading-state or the dashboard.
+#   * It shares the intraday workflow's concurrency group, so it can never
+#     run at the same time as a real trading cycle.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # SAME group as the trader: a smoke test must never overlap a live cycle.
+  group: intraday-trader
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Kolkata
+      OPTIONS_DRY_RUN: "1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: backtest-machine/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r backtest-machine/requirements.txt
+
+      - name: Instrument master cache key (today's date, IST)
+        id: imkey
+        run: echo "day=$(date +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache instrument master
+        uses: actions/cache@v4
+        with:
+          path: backtest-machine/scripmaster_cache.json
+          key: scripmaster-${{ steps.imkey.outputs.day }}
+          restore-keys: scripmaster-
+
+      - name: Restore trading state (READ ONLY - never saved back)
+        env:
+          STATE_REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+        run: |
+          cd backtest-machine
+          python state_sync.py restore
+
+      - name: Unit + acceptance suites
+        run: |
+          set -o pipefail
+          cd backtest-machine
+          python test_wed_stabilization.py
+          python test_safety.py
+          python test_telemetry.py
+          python test_stabilization.py
+
+      - name: Pre-open smoke test (entries disabled)
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+        run: |
+          # pipefail so a crashing trader cannot show a green step.
+          set -o pipefail
+          cd backtest-machine
+          python smoke_test.py
+
+      # Deliberately NO `state_sync.py save` and NO dashboard publish.
+      # A dry run must leave production state exactly as it found it.
