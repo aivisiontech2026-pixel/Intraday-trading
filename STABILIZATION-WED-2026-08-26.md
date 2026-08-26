@@ -428,6 +428,82 @@ heavily toward index options. If Wednesday enters two stock options while both
 indices carried a direction, that prediction is falsified and selection needs
 re-examining. 🟡 INFERRED.
 
+### A1.3b — The consequence of that skew (A4.1)
+
+**🟡 INFERRED. Not a defect. NOT grounds for a change today.**
+
+The prediction above states the *incidence*. This is the *consequence*, and it
+is uncomfortable: the skew concentrates the book into the historically
+**worst-performing** subset.
+
+| live-price population (n=138) | n | P&L | win |
+|---|---|---|---|
+| **index** (NIFTY, BANKNIFTY) | **29** | **−₹36,502** | **24.1%** |
+| stock | 109 | +₹8,190 | 46.8% |
+
+Applying the 1.0% spread gate to entered trades carrying a usable entry quote
+(5 excluded for want of one):
+
+| | n | P&L | win |
+|---|---|---|---|
+| **index survivors** | **29** | **−₹36,502** | **24.1%** |
+| stock survivors | 66 | +₹35,066 | 54.5% |
+
+Every index trade survives the gate. Two thirds of stock trades do not.
+
+**The structural chain:**
+
+```
+indices sit first in universe order
+  -> they clear the spread gate 100% of the time  (median 0.28%)
+  -> stocks clear it 28% of the time              (median 1.33%)
+  -> MAX_OPTION_POSITIONS = 2
+  -> the book is structurally biased toward the two symbols that lost
+     Rs.36,502 at a 24% win rate
+```
+
+**Two things follow, both for the record only:**
+
+1. **CHANGE 5 is a liquidity filter that is also, unintentionally, a
+   symbol-class filter.** Its intended effect (exclude illiquid options) and
+   its actual incidence (concentrate the book in two index symbols) are
+   different things. The second was not a design decision and was not
+   anticipated when the gate was specified.
+2. **The 2-position cap may deliver LESS diversification than the 4-position
+   book it replaced.** NIFTY and BANKNIFTY are highly correlated and a
+   directional signal will usually put both on the same side. Two correlated
+   index positions is a different risk shape from four positions spread across
+   stocks — arguably a more concentrated one, which is the opposite of the
+   cap's intent. The cap still bounds *rupee* exposure at ₹50,000; it does not
+   bound *correlation* exposure, and nothing in this build does.
+
+#### Counter-evidence, stated honestly
+
+**The sample is thin.** 7 wins in 29. Against the book-average 42.0% win rate,
+`P(X ≤ 7 | n=29, p=0.42) = 0.036` one-tailed. **Suggestive, not established** —
+and it is one test chosen after looking at the data, so the nominal p-value
+overstates the evidence.
+
+**The threshold is in-sample.** 1.0% was selected on this same dataset (§B3).
+Filtering it by that threshold and reporting the survivors repeats the
+selection problem §B3 already flags.
+
+**Confounds — what the data can and cannot rule out:**
+
+| confound | verdict | evidence |
+|---|---|---|
+| **Notional** | **RULED OUT** | index median ₹21,424 vs stock ₹20,610 — 4% apart, both bounded by `MAX_PER_TRADE` ₹25,000 |
+| **Day / session mix** | **RULED OUT** | 16 of 16 index sessions also carry stock trades. On those *same 16 sessions*: index −₹36,502, stock +₹10,529. Not different market regimes. |
+| **Entry time (09:31)** | **MOSTLY RULED OUT** | index is 66% 09:31 vs stock 38%, so the concern was real. But the gap survives the split: index non-09:31 n=10, −₹18,542, 20.0% win; stock non-09:31 n=68, +₹13,354, 48.5%. **n=10 is very thin**, so this is weakened, not eliminated. |
+| **DTE** | **NOT RULED OUT** | index median DTE 7 vs stock 13. DTE is itself an unresolved association (S-21) and cannot be used to control for anything. |
+| **Intraday correlation / regime** | **NOT RULED OUT** | two correlated indices on the same side of the same move is one bet recorded as two. Nothing in the data separates that from a symbol-class effect. |
+
+**Conclusion for the record:** the association is real in this sample and
+survives the two confounds that could be tested, but n=29 (n=10 outside 09:31)
+and an in-sample threshold are not a basis for an index-specific control.
+**No change is made today.** A4.3 states in advance what evidence would be
+required.
+
 ### A1.4 — Is per-opportunity derivable on Thursday? **YES. Nothing missing.**
 
 `(symbol, bar_ts)` is sufficient, and the collapse is a no-op:
@@ -456,6 +532,23 @@ and nothing was added.**
 ---
 
 ## A3 — OPERATOR ACTIONS
+
+### Know this before the session opens
+
+> **If both index symbols carry a direction, both slots will likely fill with
+> NIFTY and BANKNIFTY — historically the worst-performing subset of the book
+> (n=29, −₹36,502, 24% win). This is an expected consequence of the spread
+> gate's incidence, not a defect, and no change is being made today.**
+
+You are being told now so you meet it in the ledger rather than discovering it
+in the P&L. If Wednesday's book is index-heavy and loses, that is the
+**predicted** outcome of a deliberate scope decision, not evidence that the
+build failed — and per the pre-registration below, **no P&L outcome changes the
+assessment**. See §A1.3b for the evidence and its limits, and §A4.3 for the
+standard that would have to be met before an index-specific control could be
+justified.
+
+### Actions
 
 1. **Push the branch and run the smoke test — BEFORE 08:45 IST** (see B4; near
    09:15 it delays the session by one to four trader cycles):
@@ -569,3 +662,48 @@ evidence to choose between them.
 **If Wednesday trades nothing, this analysis does not run, and that is an
 acceptable outcome** — the instrument is in place and accumulates from the
 next session that trades. It will not be substituted with a P&L review.
+
+### 5. Thursday's SECONDARY analysis (A4.3) — named now
+
+The primary above stays primary. This is one additional question, no more.
+
+**Tables:** `candidate_snapshot` (all rows, entered and rejected) joined to
+`quote_snapshot` via `quote_snapshot_id`, and to `decision` via
+`candidate_id`.
+
+**Question:** *Of the candidates that passed the spread gate, what fraction
+were index symbols — and how did index and stock entries perform separately?*
+
+**Pre-stated interpretations.** Written before the data exists, so the reading
+is fixed in advance:
+
+| outcome | reading | what follows |
+|---|---|---|
+| Index share of gate survivors is **high (≳50%)** and index entries **lose** | The A1.3b chain reproduced out of sample, once | **One** out-of-sample observation added to n=29. Nothing else. One session is not evidence. |
+| Index share **high** and index entries **win** | Incidence confirmed, consequence not | A1.3b weakens. Record and continue; do not celebrate a single session either. |
+| Index share **low (≲25%)** | The A1.3 incidence prediction is **falsified** | Re-examine the spread measurement and the selection order before anything else. A falsified incidence invalidates the consequence too. |
+| No trades, or no index candidates | **Not applicable.** Not a failure, not support | Wait for the next session that trades. |
+
+**What would have to be true before an index-specific control could be
+justified.** Setting this standard now, not after a bad day:
+
+1. **Out-of-sample evidence.** The association must hold on sessions *after*
+   2026-08-26 — data that did not exist when the 1.0% threshold was chosen.
+   The current n=29 is entirely in-sample and cannot be reused.
+2. **n ≥ 60 index trades**, roughly double today's, with the effect persisting.
+   At the observed gap that is around the point where one test survives a
+   correction for having gone looking.
+3. **The DTE confound resolved or controlled.** Index median DTE 7 vs stock 13
+   (§A1.3b). While S-21 is unresolved this may be a DTE effect wearing a
+   symbol-class costume.
+4. **The correlation question separated from the symbol-class question.** Two
+   correlated indices on the same side of one move is *one bet recorded as
+   two*. If that is the mechanism, the remedy is a correlation or
+   same-direction constraint, **not** an index exclusion — different defect,
+   different fix.
+5. **A stated hypothesis about WHY**, testable independently of P&L. "Index
+   options lost money" is an observation, not a mechanism.
+
+Until all five hold, the finding stays 🟡 INFERRED and no control is built.
+**A bad Wednesday does not lower this bar** — that is precisely what
+pre-registering it is for.
