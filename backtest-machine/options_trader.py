@@ -707,7 +707,7 @@ def _eod_gate_summary(conn, today_str, now_min, log):
     for b in stab.REJECT_BUCKETS:
         n = int(acc.get(b, 0))
         if n:
-            lines.append(f"  {b.replace('rejected_', 'rejected ')}: {n}")
+            lines.append(f"  {b.replace('_', ' ')}: {n}")
     lines += [f"passed to selection: {passed}", f"entered: {entered}",
               f"identities hold: {'YES' if ok else 'NO'}",
               f"gates: {'ON' if STAB_ON else 'OFF'} "

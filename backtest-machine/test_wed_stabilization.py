@@ -1032,6 +1032,113 @@ def t_replay_harness(tmp):
                             "APPROXIMATED", "UNAVAILABLE"})
 
 
+def t_eod_summary_and_daily_loss(tmp):
+    print()
+    print("[18] CRITERION O - a zero-trade day is POSITIVELY confirmable")
+    import options_trader as ot
+    import safety_supervisor as ss
+
+    ot.DB = Path(tmp) / "eod.db"
+    telemetry.shutdown()
+    telemetry.reset_for_test(str(Path(tmp) / "eod_obs.db"))
+    conn = ot.db_init()
+    ot.meta_set(conn, "cash", 100000)
+    conn.commit()
+    sent = []
+    saved_tg = ot.telegram
+    ot.telegram = lambda m: sent.append(m)
+    try:
+        # a session that generated candidates and rejected them all
+        L = stab.GateLedger(2)
+        for _ in range(6):
+            L.generated()
+        for r_ in ("spread_above_max(3.0%>1.0%)", "spread_above_max(2.0%>1.0%)",
+                   "dte_below_min(1<2)", "signal_bar_stale",
+                   "not_selected_slot_limit", "duplicate_symbol_today"):
+            L.reject(r_)
+        acc = ot._record_day_gates(conn, "2026-08-26", L)
+        check("day accumulator counts the cycle", acc["cycles"], 1)
+        check("day accumulator totals the candidates",
+              acc["candidates_generated"], 6)
+
+        # before 15:35 the summary must stay silent
+        ot._eod_gate_summary(conn, "2026-08-26", 15 * 60 + 30, [])
+        check("no summary before 15:35", len(sent), 0)
+
+        log = []
+        ot._eod_gate_summary(conn, "2026-08-26", 15 * 60 + 35, log)
+        check("summary sent at 15:35", len(sent), 1)
+        msg = sent[0]
+        check_true("  names the session", "2026-08-26" in msg)
+        check_true("  reports the heartbeat count", "cycles (heartbeats): 1"
+                   in msg)
+        check_true("  reports candidates generated",
+                   "candidates generated: 6" in msg)
+        check_true("  itemises spread rejections", "rejected spread: 2" in msg)
+        check_true("  itemises DTE rejections", "rejected dte: 1" in msg)
+        check_true("  itemises stale-signal rejections",
+                   "rejected stale signal: 1" in msg)
+        check_true("  reports ZERO entries explicitly", "entered: 0" in msg)
+        check_true("  states whether the identities hold",
+                   "identities hold: YES" in msg)
+        check_true("  states the policy in force", "max_pos=2" in msg)
+
+        # exactly once per day, even across many cycles
+        ot._eod_gate_summary(conn, "2026-08-26", 15 * 60 + 40, [])
+        ot._eod_gate_summary(conn, "2026-08-26", 15 * 60 + 59, [])
+        check("summary is sent exactly once per session", len(sent), 1)
+    finally:
+        ot.telegram = saved_tg
+        conn.close()
+        telemetry.shutdown()
+
+    print()
+    print("[19] CRITERION Q - daily-loss policy UNCHANGED and still fires")
+    import config_contract
+    cfg = json.loads((HERE / "intraday_config.json").read_text())
+    check("max_daily_loss_percent untouched", cfg["max_daily_loss_percent"], 2)
+    check("capital untouched", cfg["capital"], 100000)
+    check("max_capital_per_trade untouched", cfg["max_capital_per_trade"],
+          25000)
+    con = config_contract.Contract(cfg)
+    check("limit is still Rs.2,000", con.daily_loss_limit(), 2000.0)
+    check("supervisor computes the same limit",
+          ss.daily_loss_limit(100000, 2), 2000.0)
+
+    # It must still fire at the REDUCED exposure level: two positions of
+    # Rs.25,000 can lose far more than Rs.2,000, so the cap does not make
+    # the halt unreachable.
+    ot.DB = Path(tmp) / "dl.db"
+    telemetry.shutdown()
+    telemetry.reset_for_test(str(Path(tmp) / "dl_obs.db"))
+    conn = ot.db_init()
+    today = TODAY
+    for pnl in (-1200.0, -900.0):
+        conn.execute(
+            "INSERT INTO options_trades(symbol,option_type,strike,expiry,qty,"
+            "entry_price,exit_price,entry_time,exit_time,pnl,reason,"
+            "price_source) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("NIFTY", "CE", 100.0, "2026-09-01", 75, 100.0, 84.0,
+             f"{today}T09:31:00", f"{today}T10:00:00", pnl, "Initial stop",
+             "STOP_LEVEL"))
+    conn.commit()
+    allowed, state = ss.entry_permission(conn, ss.OPTIONS_BOOK, today,
+                                         100000, 2)
+    check("two capped losses breach the limit", state["realized_today"],
+          -2100.0)
+    check("  entries are HALTED", allowed, False)
+    check("  reason is the daily-loss halt", state["reason"],
+          "HALTED_DAILY_LOSS")
+    check("  the limit reported is unchanged", state["limit"], 2000.0)
+
+    # worst case at the new cap: 2 x Rs.25,000 x -15% initial stop
+    worst = 2 * 25000 * 0.15
+    check_true("worst single-cycle loss at cap=2 still exceeds the limit, "
+               "so the halt is reachable", worst > 2000.0)
+    conn.close()
+    telemetry.shutdown()
+
+
 def t_credential_hygiene():
     print()
     print("[17] CHANGE 14 / U-017 - credential exposure, repository side")
@@ -1104,6 +1211,7 @@ def main():
         t_regression_guard(tmp)
         t_observability(tmp)
         t_replay_harness(tmp)
+        t_eod_summary_and_daily_loss(tmp)
         t_credential_hygiene()
         t_rollback()
     print("\n" + "=" * 72)
