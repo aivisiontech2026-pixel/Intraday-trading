@@ -16,6 +16,38 @@ register should absorb them at its next documentation-only revision.
 
 ---
 
+## HEADLINE — THE CORRECTED COST OF THE OBSERVED BOOK
+
+**Read this before any other number in this file.**
+
+```
+gross P&L as booked                                     -Rs.28,312
+less measured unpaid exit half-spread on 83 stop fills  -Rs.35,070
+less sourced statutory charges                          -Rs.48,302
+```
+
+**That is a 71% escalation on the figure this effort has been quoting**, and it
+changes the perceived scale of the problem. It is not a new loss; it is the
+same book, measured properly for the first time.
+
+**HEALTH WARNING — this is a FLOOR, not a final figure.**
+
+- It **excludes polling-latency slippage entirely.** The `STOP_LEVEL` contract
+  assumes an ideal fill at the level; a premium that genuinely gapped through
+  the stop fills worse, and that is not measured anywhere.
+- The observed exit quotes come from the poll that **detected** the breach, not
+  from the unobserved instant it occurred. Spreads at that earlier instant are
+  unknown.
+- The statutory charges are **declared rates from a published schedule**, not a
+  contract note. This is paper trading; there is nothing to reconcile against.
+
+**No historical row was rewritten, and nothing in execution, stops, trail
+arming, ranking or selection reads any of these numbers.** Gross P&L as booked
+is unchanged and remains the figure the trading engine acts on. See §B2 for
+the measurement and §N1 for the rate schedule.
+
+---
+
 ## R1 — The §5 stale-signal premise is WRONG
 
 **Package claim.** *"On Monday 2026-08-24 the first NIFTY bar read by the
@@ -276,6 +308,183 @@ on the current state, where rejected candidates left no trace at all.
 
 ---
 
+## A1 — Cadence interaction, and the unit the ledger reports in
+
+### A1.0 — The premise needs correcting first
+
+The amendment states: *"The trader evaluates entries roughly five times per
+signal bar."* **Measured, that is not what happens**, and the reason is a
+precondition already in the engine.
+
+`in_window` requires `signals_fresh`, which is true **only on a cycle that
+actually refetched signals**. Candidates are therefore built only on refresh
+cycles, never on the four cached cycles between them.
+
+| measurement | value |
+|---|---|
+| cycles total | 1,823 |
+| cycles that refreshed signals | **381 (20.9%)** |
+| cycles that produced candidates | 89 |
+| **candidate cycles with no signal refresh that cycle** | **0** |
+| median cycle gap | 56 s |
+| median refresh gap | 302 s |
+| NIFTY bars seeing exactly **one** refresh | **322 of 333** |
+
+The 11 bars with more than one refresh are all the **15:25 bar**, re-observed
+between 15:25 and 15:56 after the last bar of the day has closed — outside the
+09:30–14:30 entry window entirely. One is the 2026-08-21 15:25 bar carried into
+Monday 09:15, i.e. R1's stale bar.
+
+**So within the entry window the trader evaluates entries approximately ONCE
+per signal bar.** The cadence ratio is real (≈5 cycles per bar), but four of
+those five cycles cannot generate a candidate.
+
+### A1.1 — The side effect, corrected and recorded
+
+**Classification: 🟡 INFERRED side effect of CHANGE 5. Not a defect. Sign
+unknown.**
+
+The amendment's mechanism — *"enter on whichever cycle in this bar has the
+tightest quote"* — **cannot occur**: there is only one quote observation per
+bar at which an entry can be authorized.
+
+What CHANGE 5 **can** do is one bar-granular thing:
+
+> A candidate rejected for spread on bar *N* is dropped. If its direction
+> persists into bar *N+1*, it is re-considered there against a **new** quote.
+> The gate can therefore **defer an entry by one or more bars** rather than
+> preventing it.
+
+That is still a behaviour change and it is still unremarked, so it is recorded
+here. It is **not** intra-bar quote shopping, it operates at ~5-minute
+granularity, and it is bounded by the entry window closing at 14:30. Whether
+deferring into a later bar is better or worse than entering on the first bar is
+**unknown**, and this build does not attempt to find out.
+
+It remains true, and is the substance of the amendment's point, that **CHANGE 5
+is the first entry condition that varies between successive evaluations of a
+persisting signal.** Direction, DTE and position count are stable across bars
+while a trend holds; quoted spread is not.
+
+### A1.2 — UNIT DISCIPLINE (extension of §36 population reconciliation)
+
+**The gate ledger counts CANDIDATE EVALUATIONS. It does not count TRADE
+OPPORTUNITIES, and it does not count TRADES.**
+
+Three units, never to be compared, summed, or converted into one another
+without naming which is in use:
+
+| unit | what it is | scale per session |
+|---|---|---|
+| **cycle** | one trader run; one `cycle_heartbeat` and one `gate_ledger` row | ~315 |
+| **candidate evaluation** | one `candidate_snapshot` row: one symbol, on one refresh cycle | ~92 median, 412 max observed |
+| **trade** | one `options_trades` row | 4–5 |
+
+A rate quoted in one unit is meaningless in another. The 43/138 spread figure
+in the historical validation is **per trade taken**; the ledger's
+`rejected_spread` will be **per candidate evaluation**. They differ by more
+than a factor of two, in a direction that is not obvious — see A1.3.
+
+### A1.3 — Amended spread-rejection prediction, in the ledger's own unit
+
+**My earlier prediction of "~30–45% of candidates that reach the quote stage"
+was wrong.** It was calibrated on 43/138 entered trades — a biased subset,
+because universe-order selection fills its slots from the front of the list,
+where the index options are.
+
+Measured over all 922 recorded candidate evaluations, joined to the quote each
+was scored against:
+
+| | |
+|---|---|
+| candidate evaluations with a linked quote | 922 |
+| quote-invalid | 0 |
+| **spread > 1.0%** | **627 / 922 = 68.0%** |
+| median candidate spread | **1.290%** |
+| p75 / p90 | 1.791% / 2.941% |
+
+**Amended prediction — per candidate evaluation: `rejected_spread` ≈ 60–75% of
+candidates that reach the quote stage.**
+
+**Per opportunity: the same number.** A1.4 shows evaluations and opportunities
+are 1:1 in this system, so no separate per-opportunity prediction is needed —
+which is itself the useful finding.
+
+**Per trade attempted: ~30%**, the historical 43/138 basis. Retained only to
+show the two must not be confused.
+
+**A consequence worth predicting, because it is falsifiable:**
+
+| | candidates | median spread | pass ≤1.0% |
+|---|---|---|---|
+| NIFTY + BANKNIFTY | 47 | 0.27% / 0.32% | **100%** |
+| all stock options | 875 | — | **28.3%** |
+| NTPC, POWERGRID | 102 | 3.02% / 3.31% | **0%** |
+
+The index options are first in universe order and always pass; most stock
+options usually do not. **Prediction: whenever NIFTY and BANKNIFTY both carry a
+direction, they will consume both slots**, and Wednesday's book will skew
+heavily toward index options. If Wednesday enters two stock options while both
+indices carried a direction, that prediction is falsified and selection needs
+re-examining. 🟡 INFERRED.
+
+### A1.4 — Is per-opportunity derivable on Thursday? **YES. Nothing missing.**
+
+`(symbol, bar_ts)` is sufficient, and the collapse is a no-op:
+
+| check | result |
+|---|---|
+| candidate rows resolvable to a `bar_ts` | **922 / 922 = 100%** |
+| `(symbol, bar_ts)` groups holding more than one evaluation | **0** |
+
+**Evaluations and opportunities are already 1:1** across the entire recorded
+history — the direct consequence of A1.0.
+
+One wrinkle, stated rather than fixed:
+
+- A **freshness-rejected** candidate carries `signal_bar_ts` on its own row.
+- A **DTE-rejected** candidate does **not** — that emit passes the expiry but
+  not the bar stamp.
+- Both are recoverable by joining `candidate_snapshot.cycle_id` +
+  `symbol` → `signal_snapshot.bar_ts`. That join resolves for **100%** of rows,
+  guaranteed by A1.0: candidates exist only on refresh cycles, and a refresh
+  cycle always writes `signal_snapshot`.
+
+So the collapse works today for every rejection bucket. **Nothing is missing
+and nothing was added.**
+
+---
+
+## A3 — OPERATOR ACTIONS
+
+1. **Push the branch and run the smoke test — BEFORE 08:45 IST** (see B4; near
+   09:15 it delays the session by one to four trader cycles):
+   ```
+   git push -u origin stabilization/wed-2026-08-26
+   gh workflow run smoke-test.yml --ref stabilization/wed-2026-08-26
+   ```
+   `SECTION 34: satisfied` clears criterion N, the only open item.
+
+2. **Rotate the Telegram bot token via BotFather.** Still outstanding. The only
+   real remedy for U-017; repository-side remediation is already complete.
+
+3. **Approve the temporary policy values:** `min_dte=2`,
+   `max_entry_spread_pct=1.0`, `max_option_positions=2`,
+   `max_signal_bar_age_s=400`.
+
+4. **Absorb R1-R3 into `OPEN-ISSUE-REGISTER.md` at the next
+   documentation-only revision.**
+
+   *Open loop, recorded here because nothing else forces it.* The register
+   (branch `docs/open-issue-register-v1.1`, `6a93e9b3`, v1.2) never carried
+   the three wrong premises, so there was nothing to correct and the docs
+   branch was deliberately not touched. But after this branch merges the
+   register still will not contain the corrections, and R1's stale-signal
+   premise in particular is the kind of claim that gets re-cited. It needs a
+   separately-authorized documentation-only commit.
+
+---
+
 ## WEDNESDAY SUCCESS CRITERIA — PRE-REGISTERED
 
 *Written 2026-08-26 before market open. Committed so the result cannot be
@@ -308,8 +517,10 @@ assessment.**
 |---|---|---|
 | **DTE rejections** | **exactly 0** | any non-zero `rejected_dte`. Nearest index expiry is Tue 2026-09-01 (DTE 6); stock expiry 2026-09-29 (DTE 34). Both clear the floor of 2. |
 | **Freshness rejections** | **0, or a small number confined to the 09:30–09:35 cycles** | any rejection after 10:00 on a day with no feed outage |
-| **Spread rejections** | **the dominant bucket — roughly 30–45% of candidates that reach the quote stage** | near-zero rejections (gate not wired) or ~100% (threshold or spread computation wrong) |
+| **Spread rejections** *(unit: candidate evaluations — see A1.2)* | **the dominant bucket — 60–75% of candidates reaching the quote stage.** Amended from "30–45%": that was a per-trade figure. Per opportunity is the same number (A1.4). | below ~40% or above ~90%. Near-zero = gate not wired; ~100% = threshold or spread arithmetic wrong |
+| **Book composition** | **index-skewed.** If NIFTY and BANKNIFTY both carry a direction, they take both slots (100% historical pass rate, first in universe order) | two stock options entered while both indices carried a direction |
 | **Trades entered** | **0 to 2** | 3 or more — would mean the cap failed |
+| **Candidate evaluations** | ~90–400 for the session, on ~60 refresh cycles inside the entry window — **not** ~315, and **not** 4 | evaluations on cycles that did not refresh signals (A1.0 says zero) |
 | **Peak concurrent positions** | **≤ 2** | 3 or more |
 | **Max deployed capital** | **≤ ₹50,000** | anything above |
 | **Trailing exits below entry** | **0** | any trailing exit filling below entry × 1.0006 |
@@ -322,7 +533,8 @@ assessment.**
 | `candidates_generated = 0` on cycles inside the entry window, with `signals_ok=1` and `master_ok=1` | **DEFECT** — candidate construction is broken, not a gate |
 | `rejected_stale_signal` ≈ every candidate, all session | **DEFECT** — bar-age computation or timezone handling, not a stale feed. Cross-check `heartbeat.signals_ok` and `signal_snapshot.bar_age_s`. |
 | `rejected_dte > 0` on Wednesday | **DEFECT** — prediction 2 falsified; expiry resolution is wrong |
-| `rejected_spread` high **and** `quote_snapshot` shows genuinely wide books | **CORRECT REJECTION** |
+| `rejected_spread` high **and** `quote_snapshot` shows genuinely wide books | **CORRECT REJECTION** — 68% is the expected rate, not an alarm |
+| a rate compared across units (evaluations vs trades vs cycles) | **ANALYSIS ERROR, not a system defect.** Name the unit before drawing any conclusion (A1.2) |
 | `rejected_spread` high **and** `quote_snapshot` shows tight books | **DEFECT** — spread arithmetic |
 | `rejected_quote_invalid` high with `quotes_fetched > 0` | **DEFECT** — quote parsing |
 | `identities_ok = 0` on any cycle | **DEFECT — unconditional.** A candidate went unaccounted; the ledger cannot be trusted for any other conclusion that day. |
