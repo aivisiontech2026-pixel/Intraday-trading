@@ -33,6 +33,22 @@ name: Pre-open Smoke Test (dry run, entries disabled)
 
 on:
   workflow_dispatch: {}
+  # TEMPORARY - TEST INFRASTRUCTURE ONLY. REMOVE BEFORE MERGE.
+  #
+  # GitHub registers `workflow_dispatch` only when the workflow file exists on
+  # the DEFAULT branch, and this file exists only on the stabilization branch,
+  # so dispatch cannot be invoked for it. A `push` trigger carries no such
+  # requirement, so this makes Criterion N executable from the branch itself
+  # without touching `main` and without the GitHub CLI.
+  #
+  # Scoped to the single stabilization branch: it cannot fire on `main`, on
+  # `trading-state`, on `gh-pages`, or on any future branch.
+  #
+  # NOTE: the push IS the trigger. Any commit pushed to this branch starts a
+  # run that joins the `intraday-trader` concurrency group - so do not push to
+  # it between 09:15 and 15:30 IST (see the B4 hazard note below).
+  push:
+    branches: [stabilization/wed-2026-08-26]
 
 permissions:
   contents: read
