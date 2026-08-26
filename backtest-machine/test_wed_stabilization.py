@@ -422,8 +422,8 @@ def t_costs():
     c = stab.round_trip_cost(100.0, 110.0, 75)
     check_true("cost breakdown produced", c is not None)
     check_true("brokerage is two orders", c["brokerage"] == 40.0)
-    check_true("STT charged on the SELL leg only",
-               abs(c["stt"] - 110.0 * 75 * 0.001) < 1e-9)
+    check_true("STT charged on the SELL leg only, at the sourced 0.15%",
+               abs(c["stt"] - 110.0 * 75 * 0.0015) < 1e-9)
     check_true("stamp duty charged on the BUY leg only",
                abs(c["stamp_duty"] - 100.0 * 75 * 0.00003) < 1e-9)
     check_true("total is the sum of the parts",
@@ -439,10 +439,24 @@ def t_costs():
           stab.spread_friction(101, 100, 1, 2, 75), None)
     check("missing quote -> None", stab.spread_friction(None, None, 1, 2, 75),
           None)
-    check_true("rate source is DECLARED, not inferred",
-               "Declared in stabilization.COST_RATES" in stab.COST_RATE_SOURCE)
+    check_true("rate source names the publisher and the page",
+               "angelone.in/exchange-transaction-charges"
+               in stab.COST_RATE_SOURCE)
+    check_true("rate source records the retrieval date",
+               "2026-08-26" in stab.COST_RATE_SOURCE)
+    check_true("rate source states there is no contract note to reconcile",
+               "PAPER TRADING" in stab.COST_RATE_SOURCE)
     check_true("rate source states it is reporting-only",
-               "Reporting only" in stab.COST_RATE_SOURCE)
+               "REPORTING ONLY" in stab.COST_RATE_SOURCE)
+    check("STT rate matches the published schedule",
+          stab.COST_RATES["stt_pct_sell_premium"], 0.15)
+    check("exchange rate matches the published schedule",
+          stab.COST_RATES["exchange_txn_pct"], 0.0355299)
+    check("IPFT rate matches the published schedule",
+          stab.COST_RATES["ipft_pct"], 0.002)
+    check_true("GST base includes IPFT, per the schedule",
+               abs(c["gst"] - (c["brokerage"] + c["exchange"] + c["sebi"]
+                               + c["ipft"]) * 0.18) < 1e-9)
 
 
 # ============================== LAYER 2: END-TO-END process() ==============
@@ -843,6 +857,11 @@ def t_concurrency():
               for ln in smoke.splitlines()), False)
     check_true("the smoke test arms the dry run",
                'OPTIONS_DRY_RUN: "1"' in smoke)
+    # B4: the timing hazard is documented where an operator will meet it.
+    check_true("the smoke test carries the scheduling warning",
+               "RUN THIS BEFORE 08:45 IST" in smoke)
+    check_true("  and records why a separate group was rejected",
+               "REJECTED" in smoke and "concurrently" in smoke)
 
     ss = (HERE / "state_sync.py").read_text(encoding="utf-8")
     check("state push is NOT a force-push", "--force" in ss, False)

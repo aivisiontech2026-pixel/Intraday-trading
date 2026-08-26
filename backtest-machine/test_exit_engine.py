@@ -18,7 +18,7 @@ booked -Rs.460 where the true peak implied +Rs.655.
 import os
 import sqlite3
 import sys
-from datetime import date, datetime, time as dtime
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -31,6 +31,21 @@ import angelone_client as angel
 import options_trader as ot
 
 TODAY = date.today()
+# B1: the seeded contract's expiry must be RELATIVE to the run date.
+#
+# It was hardcoded "2026-08-25". Once the wall clock passed that date every
+# scripted cycle closed the position as "Expired contract" before the
+# trailing-stop logic under test could run, and the whole suite failed on
+# line 132 with a TypeError - identically at e240b458, so this was never a
+# regression, just a test that silently acquired an expiry date.
+#
+# A permanently red suite is a suite nobody reads, and this is the EXIT
+# ENGINE: the next genuine exit regression would have landed in an
+# already-red run and been invisible. Seven days out keeps the contract
+# alive for every scripted cycle and clears the DTE floor, so the test's
+# intent - intra-interval peak capture and the trailing stop - is
+# unchanged.
+SEED_EXPIRY = (TODAY + timedelta(days=7)).isoformat()
 REAL_DT = datetime
 FAILURES = []
 
@@ -77,7 +92,7 @@ def seed(db, entry_px, day_high=None, day_low=None):
         "entry_price,entry_time,token,trading_symbol,lots,lotsize,high_water,"
         "stop_price,last_price,day_high_seen,day_low_seen) "
         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        ("RELIANCE", "CE", 1290, "2026-08-25", 100, entry_px,
+        ("RELIANCE", "CE", 1290, SEED_EXPIRY, 100, entry_px,
          f"{TODAY}T09:31:00", "99999", TRACKED, 1, 100, entry_px,
          round(entry_px * 0.85, 2), entry_px,
          day_high if day_high is not None else entry_px,
@@ -181,15 +196,26 @@ def test_trail_label_boundary():
     NOT activate. The operators are aligned as defensive consistency; what
     this test enforces is the invariant that matters, that a trailed stop
     is never labelled an initial one.
+
+    U-014 (CHANGE 4) MOVED THE EXPECTED LEVEL HERE, and this is the whole
+    reason a permanently red suite is dangerous: the expectation below was
+    96.844 - 110.05 x 0.88, a stop 3.156% BELOW the 100.00 entry. That was
+    the trailing dead zone, ENCODED AS CORRECT in a test that could not
+    run. The trail is now floored at entry + round-trip cost. The label
+    invariant this test exists for is unchanged and still asserted.
     """
     print("\n[4] label matches behaviour just past the activation threshold")
     db = "t_label.db"
     seed(db, 100.00, day_high=100.00, day_low=100.00)
     _, pos = cycle(db, 10, 0, 110.05, high=110.05)     # just above +10%
-    check("stop was trailed", pos["stop_price"], 96.844)
+    check("stop was trailed", pos["stop_price"], 100.06)
     check("trailed above the initial stop", pos["stop_price"] > 85.00, True)
+    # U-014: an armed trail may never sit below entry.
+    check("armed trail is NOT below entry (was 96.844)",
+          pos["stop_price"] >= 100.00, True)
     trade, _ = cycle(db, 10, 30, 96.00, low=96.00)
     check("reason says Trailing, not Initial", trade["reason"], "Trailing stop")
+    check("exit is not a loss", trade["exit_price"] >= 100.00, True)
     os.remove(db)
 
 

@@ -16,6 +16,20 @@ name: Pre-open Smoke Test (dry run, entries disabled)
 #     run cannot advance trading-state or the dashboard.
 #   * It shares the intraday workflow's concurrency group, so it can never
 #     run at the same time as a real trading cycle.
+#
+# B4 - SCHEDULING HAZARD. RUN THIS BEFORE 08:45 IST, OR THE EVENING BEFORE.
+#   Sharing the trader's concurrency group with cancel-in-progress: false is
+#   correct for state safety and hazardous for TIMING: neither run is
+#   cancelled, so the next trader run QUEUES BEHIND this job. A smoke test
+#   started near 09:15 delays the session by one full job - dependency
+#   install, four suites and one live cycle, roughly 2-4 minutes plus runner
+#   acquisition - which at a ~1/min trigger cadence costs one to four trader
+#   cycles.
+#
+#   Giving this workflow its own concurrency group was REJECTED: that would
+#   let a smoke test and a live cycle write the same trading-state branch
+#   concurrently. Queueing is the safe failure mode. The fix is scheduling
+#   discipline, not weaker isolation.
 
 on:
   workflow_dispatch: {}

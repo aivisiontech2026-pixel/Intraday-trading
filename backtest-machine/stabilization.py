@@ -390,19 +390,25 @@ def trail_stop_level(entry_price, high_water, activate_pct, trail_pct,
 # edit with a visible source (see COST_RATE_SOURCE).
 COST_RATES = OrderedDict((
     ("brokerage_per_order", 20.0),          # flat, per executed order
-    ("stt_pct_sell_premium", 0.10),         # sell side only, on premium
-    ("exchange_txn_pct", 0.0503),           # NSE F&O options, on premium
-    ("sebi_pct", 0.0001),
-    ("ipft_pct", 0.0005),
-    ("stamp_duty_pct_buy", 0.003),          # buy side only
-    ("gst_pct_on_charges", 18.0),           # on brokerage + txn + sebi
+    ("stt_pct_sell_premium", 0.15),         # sell side only, on premium
+    ("exchange_txn_pct", 0.0355299),        # NSE equity options, buy + sell
+    ("sebi_pct", 0.0001),                   # Rs.10 / crore
+    ("ipft_pct", 0.002),
+    ("stamp_duty_pct_buy", 0.003),          # buy side only, on premium
+    ("gst_pct_on_charges", 18.0),           # brokerage + txn + SEBI + IPFT
 ))
 COST_RATE_SOURCE = (
-    "Declared in stabilization.COST_RATES: NSE F&O OPTIONS published rate "
-    "card as applied by a flat-fee discount broker (Rs.20/order). This is "
-    "NOT read from intraday_config.json's cost_per_side (0.0003), which is "
-    "a different percentage-of-turnover model used by the stock backtest "
-    "and is classified DEFERRED in config_contract.py. Reporting only: no "
+    "Angel One published schedule for EQUITY OPTIONS (NSE F&O), retrieved "
+    "2026-08-26 from https://www.angelone.in/exchange-transaction-charges : "
+    "brokerage Rs.20/executed order; STT 0.15% sell side on premium; "
+    "exchange transaction 0.0355299% buy+sell; SEBI turnover Rs.10/crore; "
+    "IPFT 0.002%; stamp duty 0.003% buy side on premium; GST 18% on "
+    "brokerage + transaction + SEBI + IPFT. "
+    "This is PAPER TRADING, so there is no contract note to reconcile "
+    "against - these are declared rates, not observed ones. NOT read from "
+    "intraday_config.json's cost_per_side (0.0003), a different "
+    "percentage-of-turnover model used by the stock backtest and "
+    "classified DEFERRED in config_contract.py. REPORTING ONLY: no "
     "execution, stop, trail, ranking or selection path reads these.")
 
 
@@ -424,7 +430,7 @@ def round_trip_cost(entry_price, exit_price, qty, rates=None):
     sebi = turnover * r["sebi_pct"] / 100.0
     ipft = turnover * r["ipft_pct"] / 100.0
     stamp = buy_val * r["stamp_duty_pct_buy"] / 100.0
-    gst = (brokerage + exch + sebi) * r["gst_pct_on_charges"] / 100.0
+    gst = (brokerage + exch + sebi + ipft) * r["gst_pct_on_charges"] / 100.0
     return OrderedDict((
         ("brokerage", brokerage), ("stt", stt), ("exchange", exch),
         ("sebi", sebi), ("ipft", ipft), ("stamp_duty", stamp), ("gst", gst),
