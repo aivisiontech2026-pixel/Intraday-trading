@@ -132,7 +132,12 @@ def test_selection_uses_post_exit_capacity():
 def test_live_and_shadow_agree_on_capacity():
     print("\n[6] S-25: both paths read the same table at the same point")
     src = (HERE / "options_trader.py").read_text(encoding="utf-8")
-    shadow = src.index("slots = max(0, MAX_POSITIONS - len(open_rows))")
+    # CHANGE 6 gave the options book its OWN cap key so the stock book's
+    # `max_open_positions` is untouched. The shadow path must read the same
+    # cap the live path enforces, or the shadow evidence measures a book
+    # production cannot open.
+    shadow = src.index(
+        "slots = max(0, MAX_OPTION_POSITIONS - len(open_rows))")
     live = src.index("open_count = conn.execute(")
     # the live entry path's count comes after selection, from the same table
     check("shadow capacity precedes live capacity", shadow < live, True)

@@ -196,14 +196,31 @@ def test_candidate_snapshot_has_production_call_site():
     src = (HERE / "options_trader.py").read_text(encoding="utf-8")
     check("emit_candidate called in production",
           "telemetry.emit_candidate(" in src, True)
-    # it must sit in the ranking-selection block, after position management
-    i_call = src.index("telemetry.emit_candidate(")
+    # CHANGE 9 / S-41 widened this. There are now TWO production call
+    # sites, and that is the point: candidate linkage was 0% because only
+    # candidates that survived to ranking were ever recorded.
+    #
+    #   1. inside consider()  - REJECTED candidates, at the gate that
+    #                           dropped them, so a zero-entry cycle is
+    #                           still fully explained;
+    #   2. after selection    - ELIGIBLE candidates, whose returned id is
+    #                           carried into the ENTRY decision row.
     i_sel = src.index("picks, rejections = ranking.select(")
     i_exit = src.index("for pos in positions:")
-    check("emitted at the ranking-selection event", i_call > i_sel, True)
+    i_eligible = src.index("cand_ids[c[\"name\"]] = telemetry.emit_candidate(")
+    check("eligible candidates emitted after ranking selection",
+          i_eligible > i_sel, True)
     check("which is after position management", i_sel > i_exit, True)
-    check("no trading branch reads its return value",
-          "= telemetry.emit_candidate(" in src, False)
+    check("rejected candidates are ALSO emitted, at the gate",
+          src.count("telemetry.emit_candidate(") >= 3, True)
+    # The return value now has exactly one consumer: the candidate_id that
+    # links a candidate to its ENTRY decision. It still drives no trading
+    # branch - nothing tests it, and an emit failure returns None, which
+    # only leaves the linkage column NULL.
+    check("the only consumer is the traceability map",
+          src.count("= telemetry.emit_candidate("), 1)
+    check("no branch is taken on the returned id",
+          "if telemetry.emit_candidate(" in src, False)
 
     # and it records what it is given
     fresh()

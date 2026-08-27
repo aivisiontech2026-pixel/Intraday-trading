@@ -220,7 +220,12 @@ def test_g_halt_does_not_touch_exits():
     src = (HERE / "options_trader.py").read_text(encoding="utf-8")
     i_gate = src.index("entry_allowed, safety_state =")
     i_posloop = src.index("for pos in positions:")
-    i_entryloop = src.index("for cand in entry_list:")
+    # CHANGE 9 renamed the entry loop's iterable: `entry_list` is now
+    # passed through the explicit production selection stage first, and the
+    # loop iterates the SELECTED subset. The property under test is
+    # unchanged - the entry loop still runs strictly after the
+    # position-management loop.
+    i_entryloop = src.index("for cand in selected:")
     check("position-management loop is NOT inside the entry gate",
           i_posloop > i_gate, True)
     check("entry loop comes after position management",
