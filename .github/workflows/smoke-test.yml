@@ -61,9 +61,11 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
+    # OPTIONS_DRY_RUN is deliberately NOT here. It belongs to the smoke-test
+    # step alone - see the note on that step. TZ is job-wide because every
+    # step must agree on the trading date.
     env:
       TZ: Asia/Kolkata
-      OPTIONS_DRY_RUN: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -107,6 +109,14 @@ jobs:
 
       - name: Pre-open smoke test (entries disabled)
         env:
+          # SCOPED TO THIS STEP ONLY. It was job-level, which armed the dry
+          # run during the suite above: stabilization.authorize() then refused
+          # every ENTRY with `other_dry_run` BEFORE reaching the gate under
+          # test, so 14 assertions that expect an authorized entry failed and
+          # t_observability crashed on the resulting empty result set. The
+          # flag disarms the LIVE smoke test; it was never meant to be in
+          # force while the suite exercises the authorization path.
+          OPTIONS_DRY_RUN: "1"
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
           ANGEL_PIN: ${{ secrets.ANGEL_PIN }}

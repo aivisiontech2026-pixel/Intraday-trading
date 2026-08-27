@@ -48,6 +48,34 @@ def check_true(name, got):
     check(name, bool(got), True)
 
 
+def guard_row(row, label, width):
+    """A MISSING row must FAIL, not crash.
+
+    `t_observability` did `row[0]` on a `fetchone()` that returned None. The
+    TypeError aborted the whole run and hid every assertion after it - so a
+    harness that could not report was the thing standing between us and a
+    readable failure.
+
+    When the row is present it is returned untouched, so nothing about what
+    the checks assert changes. When it is absent, one explicit failure names
+    what was missing and a tuple of Nones is returned, letting every
+    dependent check below still run and still fail, readably.
+    """
+    if row is not None:
+        return row
+    check(f"{label}: a row exists to assert on", "no row", "a row")
+    return (None,) * width
+
+
+def le(a, b):
+    """None-safe `<=`. A missing value is never 'less than or equal'.
+
+    Needed because guard_row() yields Nones, and `None <= None` raises -
+    which would reintroduce the very crash this is here to remove.
+    """
+    return a is not None and b is not None and a <= b
+
+
 def near(name, got, want, tol=1e-6):
     _N[0] += 1
     ok = got is not None and abs(got - want) <= tol
@@ -857,6 +885,33 @@ def t_concurrency():
               for ln in smoke.splitlines()), False)
     check_true("the smoke test arms the dry run",
                'OPTIONS_DRY_RUN: "1"' in smoke)
+
+    # --- ANTI-REGRESSION: dry-run scoping -----------------------------
+    #
+    # OPTIONS_DRY_RUN was job-level. That armed the dry run during THIS
+    # suite, so stabilization.authorize() refused every ENTRY with
+    # `other_dry_run` before reaching the gate under test - inverting what
+    # 14 assertions were measuring and crashing t_observability on the
+    # empty result set that followed. The flag must reach the live smoke
+    # step and nothing else.
+    #
+    # Asserted positionally rather than with a YAML parser: pyyaml is NOT
+    # in requirements.txt, so importing it here would fail on the runner
+    # exactly the way this bug did.
+    # Comments are stripped first: the file explains WHY the flag is not
+    # job-level, and those words must not be mistaken for a declaration.
+    code = "\n".join(ln.split("#", 1)[0] for ln in smoke.splitlines())
+    check("OPTIONS_DRY_RUN is declared exactly once",
+          code.count("OPTIONS_DRY_RUN"), 1)
+    i_flag = code.index("OPTIONS_DRY_RUN")
+    i_suites = code.index("- name: Unit + acceptance suites")
+    i_smoke = code.index("- name: Pre-open smoke test")
+    check_true("  it is scoped INSIDE the smoke-test step, not job-level",
+               i_flag > i_smoke)
+    check_true("  so it is NOT in force during the acceptance suites",
+               i_flag > i_suites)
+    check_true("  TZ stays job-wide (every step needs the same date)",
+               code.index("TZ: Asia/Kolkata") < i_suites)
     # B4: the timing hazard is documented where an operator will meet it.
     check_true("the smoke test carries the scheduling warning",
                "RUN THIS BEFORE 08:45 IST" in smoke)
@@ -925,9 +980,11 @@ def t_observability(tmp):
     try:
         check("cycle heartbeat written",
               o.execute("SELECT COUNT(*) FROM cycle_heartbeat").fetchone()[0], 1)
-        hb = o.execute("SELECT auth_ok,master_ok,signals_ok,quotes_fetched,"
-                       "gates_evaluated,entry_window,candidates_generated "
-                       "FROM cycle_heartbeat").fetchone()
+        hb = guard_row(
+            o.execute("SELECT auth_ok,master_ok,signals_ok,quotes_fetched,"
+                      "gates_evaluated,entry_window,candidates_generated "
+                      "FROM cycle_heartbeat").fetchone(),
+            "cycle_heartbeat", 7)
         check("  heartbeat: auth ok", hb[0], 1)
         check("  heartbeat: master ok", hb[1], 1)
         check("  heartbeat: signals ok", hb[2], 1)
@@ -936,13 +993,15 @@ def t_observability(tmp):
         check("  heartbeat: entry window recorded", hb[5], 1)
         check("  heartbeat: candidate count recorded", hb[6], 2)
 
-        gl = o.execute("SELECT candidates_generated,passed_to_selection,"
-                       "entered,identities_ok FROM gate_ledger").fetchone()
-        check("gate ledger written", gl is not None, True)
+        gl = guard_row(
+            o.execute("SELECT candidates_generated,passed_to_selection,"
+                      "entered,identities_ok FROM gate_ledger").fetchone(),
+            "gate_ledger", 4)
+        check("gate ledger written", gl[0] is not None, True)
         check("  identities hold", gl[3], 1)
         check("  generated == passed + rejections", gl[0], 2)
-        check("  entered <= passed", gl[2] <= gl[1], True)
-        check("  entered <= MAX_OPTION_POSITIONS", gl[2] <= 2, True)
+        check("  entered <= passed", le(gl[2], gl[1]), True)
+        check("  entered <= MAX_OPTION_POSITIONS", le(gl[2], 2), True)
 
         ents = o.execute("SELECT decision_id,candidate_id FROM decision "
                          "WHERE action='ENTRY'").fetchall()
@@ -950,11 +1009,14 @@ def t_observability(tmp):
         check("EVERY entry carries a candidate_id (was 0/34 historically)",
               all(e[1] for e in ents), True)
         for _, cid in ents:
-            row = o.execute(
-                "SELECT symbol,cycle_id,selection_policy,gate_result,"
-                "spread_pct,signal_bar_ts FROM candidate_snapshot "
-                "WHERE candidate_id=?", (cid,)).fetchone()
-            check_true("  candidate resolves to a snapshot", row is not None)
+            row = guard_row(
+                o.execute(
+                    "SELECT symbol,cycle_id,selection_policy,gate_result,"
+                    "spread_pct,signal_bar_ts FROM candidate_snapshot "
+                    "WHERE candidate_id=?", (cid,)).fetchone(),
+                "candidate_snapshot", 6)
+            check_true("  candidate resolves to a snapshot",
+                       row[0] is not None)
             check("  selection policy recorded", row[2], "universe_order_v1")
             check("  gate verdict recorded", row[3], "ELIGIBLE")
             check_true("  cycle linkage present", bool(row[1]))
@@ -985,9 +1047,11 @@ def t_observability(tmp):
     try:
         pe = o.execute("SELECT COUNT(*) FROM post_exit_path").fetchone()[0]
         check_true("post_exit_path is POPULATED (was 0 rows)", pe > 0)
-        row = o.execute("SELECT minutes_since_exit,ltp,entry_price,exit_price,"
-                        "exit_reason,underlying_spot FROM post_exit_path "
-                        "LIMIT 1").fetchone()
+        row = guard_row(
+            o.execute("SELECT minutes_since_exit,ltp,entry_price,exit_price,"
+                      "exit_reason,underlying_spot FROM post_exit_path "
+                      "LIMIT 1").fetchone(),
+            "post_exit_path", 6)
         check_true("  minutes_since_exit recorded", row[0] is not None)
         check_true("  option mark recorded", row[1] is not None)
         check_true("  entry and exit price recorded (recovery is derivable)",
@@ -1087,7 +1151,9 @@ def t_eod_summary_and_daily_loss(tmp):
         log = []
         ot._eod_gate_summary(conn, "2026-08-26", 15 * 60 + 35, log)
         check("summary sent at 15:35", len(sent), 1)
-        msg = sent[0]
+        # Same class as guard_row: an empty list must FAIL the checks below,
+        # not raise IndexError and abort the run.
+        msg = sent[0] if sent else ""
         check_true("  names the session", "2026-08-26" in msg)
         check_true("  reports the heartbeat count", "cycles (heartbeats): 1"
                    in msg)
@@ -1210,10 +1276,41 @@ def t_rollback():
                ["enabled"] is False)
 
 
+def t_dry_run_not_armed():
+    """The suite must NOT run with the dry run armed.
+
+    If it is, `authorize(ENTRY, ...)` short-circuits to `other_dry_run`
+    before any gate is consulted, and every assertion that expects an
+    authorized entry inverts. That is not a gate failure and must never be
+    read as one - so it is checked FIRST, and named.
+    """
+    print()
+    print("[0] PRECONDITION - the dry run must be DISARMED for this suite")
+    armed = stab.get_config({})["dry_run"]
+    env = os.environ.get("OPTIONS_DRY_RUN")
+    check("OPTIONS_DRY_RUN is not set in this environment", env, None)
+    check("stabilization dry_run is disarmed", armed, False)
+    if armed:
+        print()
+        print("  " + "!" * 66)
+        print("  ABORTING: the dry run is ARMED while the acceptance suite is")
+        print("  running. Every ENTRY authorization below would be refused")
+        print("  with 'other_dry_run' BEFORE its gate is reached, so the")
+        print("  failures that follow would describe the environment, not the")
+        print("  build. Scope OPTIONS_DRY_RUN to the smoke-test step only.")
+        print("  " + "!" * 66)
+    return not armed
+
+
 def main():
     print("=" * 72)
     print("WEDNESDAY 2026-08-26 STABILIZATION ACCEPTANCE TESTS")
     print("=" * 72)
+    if not t_dry_run_not_armed():
+        print()
+        print(f"{_N[0]} assertions, {len(FAILURES)} failed")
+        print("RESULT: FAIL (precondition)")
+        return 1
     with tempfile.TemporaryDirectory() as tmp:
         t_signal_freshness()
         t_dte()
