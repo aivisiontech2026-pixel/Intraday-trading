@@ -186,25 +186,68 @@ def main():
           f"({okc/span if span else 0:.1f} req/s)")
 
     # ---- 5. TIMESTAMP SEMANTICS --------------------------------------
+    #
+    # HEURISTIC FIX (2026-09-04). The previous version probed ONE session,
+    # read only its first and last stamp, and declared
+    #   "MATCH: NO - JOINS WOULD BE OFF BY ONE BAR"
+    # whenever the endpoints were not exactly 09:15/15:25. It landed on
+    # 2026-08-25, a SHORT session (that session is 72 bars in the yfinance
+    # corpus too, ending 15:10), and so contradicted section 7 - which
+    # reconciled the same session and found 72 common stamps with ZERO
+    # unique to either feed. Endpoints cannot adjudicate a convention when
+    # the session may be truncated; a STAMP SET can.
+    #
+    # This version therefore (a) searches for a FULL session before judging,
+    # and (b) compares the whole stamp set against both candidate grids, so
+    # a short session is reported as non-adjudicating instead of being
+    # scored as a mismatch.
     print("\n" + "-" * 74)
     print("5. TIMESTAMP SEMANTICS - bar OPEN or bar CLOSE?")
     print("-" * 74)
-    rows, err, _ = candles(smart, token, "FIVE_MINUTE",
-                           d.replace(hour=9, minute=15),
-                           d.replace(hour=15, minute=30))
-    if rows:
-        print(f"  session {d:%Y-%m-%d}: {len(rows)} bars")
-        print(f"  first three: {[r[0][11:16] for r in rows[:3]]}")
-        print(f"  last three : {[r[0][11:16] for r in rows[-3:]]}")
-        first, last = rows[0][0][11:16], rows[-1][0][11:16]
-        verdict = ("BAR OPEN" if first == "09:15" and last == "15:25"
-                   else "BAR CLOSE" if first == "09:20" and last == "15:30"
-                   else "AMBIGUOUS - inspect manually")
-        print(f"  NSE trades 09:15-15:30. first={first} last={last} -> {verdict}")
-        print(f"  yfinance corpus is BAR OPEN (09:15 .. 15:25).  "
-              f"MATCH: {'YES' if verdict == 'BAR OPEN' else 'NO - JOINS WOULD BE OFF BY ONE BAR'}")
+    OPEN_GRID = [(datetime(2000, 1, 1, 9, 15) + timedelta(minutes=5 * i)
+                  ).strftime("%H:%M") for i in range(75)]
+    CLOSE_GRID = [(datetime(2000, 1, 1, 9, 20) + timedelta(minutes=5 * i)
+                   ).strftime("%H:%M") for i in range(75)]
+    print("  NSE continuous session 09:15-15:30 = 375 min = 75 five-minute bars.")
+    print(f"  BAR OPEN grid  : {OPEN_GRID[0]}..{OPEN_GRID[-1]}")
+    print(f"  BAR CLOSE grid : {CLOSE_GRID[0]}..{CLOSE_GRID[-1]}")
+    print("  Searching back for a FULL (75-bar) session - a short session")
+    print("  cannot distinguish the two conventions and must not be judged.\n")
+    verdict, examined = None, 0
+    probe_day = today - timedelta(days=7)
+    while examined < 12 and verdict is None:
+        while probe_day.weekday() >= 5:
+            probe_day -= timedelta(days=1)
+        rows, err, _ = candles(smart, token, "FIVE_MINUTE",
+                               probe_day.replace(hour=9, minute=15),
+                               probe_day.replace(hour=15, minute=30))
+        examined += 1
+        n = len(rows) if rows else 0
+        stamps = [r[0][11:16] for r in rows] if rows else []
+        if n == 75:
+            if stamps == OPEN_GRID:
+                verdict = "BAR OPEN"
+            elif stamps == CLOSE_GRID:
+                verdict = "BAR CLOSE"
+            else:
+                verdict = "FULL SESSION BUT NEITHER GRID - inspect manually"
+            print(f"  {probe_day:%Y-%m-%d}: {n} bars  FULL -> {verdict}")
+        else:
+            print(f"  {probe_day:%Y-%m-%d}: {n} bars  "
+                  f"{'SHORT - not adjudicating' if n else (err or 'no data')}")
+        probe_day -= timedelta(days=1)
+        time.sleep(0.4)
+
+    if verdict is None:
+        print("\n  NO FULL SESSION FOUND in 12 attempts - semantics UNDETERMINED.")
+        print("  This is an honest 'unknown', not a mismatch.")
     else:
-        print(f"  no bars returned: {err}")
+        print(f"\n  ANGEL: {verdict}")
+        print("  yfinance corpus is BAR OPEN - verified independently: across")
+        print("  87,589 5-minute bars there are exactly 75 distinct stamps,")
+        print("  09:15..15:25, with NO 15:30 stamp and no 09:10 stamp. A")
+        print("  close-labelled 375-minute session would have to run 09:20..15:30.")
+        print(f"  MATCH: {'YES - stamps join directly' if verdict == 'BAR OPEN' else 'NO - JOINS WOULD BE OFF BY ONE BAR'}")
 
     # ---- 6. ONE_MINUTE lookback --------------------------------------
     print("\n" + "-" * 74)

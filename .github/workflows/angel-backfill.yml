@@ -1,0 +1,125 @@
+name: Angel Backfill - 3y of 5-minute bars (read only)
+
+# Backfills the signal-research corpus from Angel One at the PRODUCTION
+# timeframe, then validates coverage, determines whether the prices are
+# split-adjusted, and re-runs the frozen control - all on the runner, all
+# printed to the log.
+#
+# GATE INTERLOCK. `gate_verdict` is REQUIRED and the script refuses to
+# request a single candle unless it is INTERCHANGEABLE or ANGEL_ONLY. Run
+# "Angel Gate - direction agreement" first and copy its printed verdict.
+# Typing a verdict the gate did not produce defeats the entire point of
+# pre-stating the rule; the interlock is a safety catch, not the safeguard.
+#
+# WHY THIS IS SAFE
+#   * READ ONLY. No order, no trading call, no state write, no dashboard
+#     publish, no production database is opened.
+#   * `permissions: contents: read` - structurally unable to write to the
+#     repository.
+#   * workflow_dispatch ONLY. No push trigger, no schedule.
+#
+# GETTING THE DATA OUT: ARTIFACT, NOT A BRANCH.
+#   Rejected a research branch for three reasons. (1) It requires
+#   `contents: write`; that capability must not exist in a workflow sitting
+#   beside the live trader's `trading-state` and `gh-pages` branches, and a
+#   scoped PAT would mean adding a write-capable secret to the same
+#   repository whose secrets the trader reads. (2) The repository is PUBLIC:
+#   a branch would publish ~700k bars permanently and grow every clone of
+#   the trading bot forever. (3) A full backfill takes ~10 minutes, so
+#   re-dispatching is cheaper than engineering cross-run resume.
+#
+# RESUMABILITY is therefore WITHIN a run: the corpus is committed to SQLite
+# after every symbol, and a re-run in the same job skips symbols already
+# stored (see done_symbols()).
+#
+# EXPECTED COST at the probe's measured mechanics (1,611-record cap,
+# 1.5 req/s untroubled): ~36 requests per symbol, ~720 total, ~9 minutes at
+# the conservative 0.75 s spacing this uses.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gate_verdict:
+        description: 'Verdict printed by the direction-agreement gate'
+        required: true
+        type: choice
+        options:
+          - INTERCHANGEABLE
+          - ANGEL_ONLY
+      years:
+        description: 'Years of history to request'
+        required: false
+        default: '3'
+        type: string
+      allow_market_hours:
+        description: 'Run even during 09:15-15:30 IST (queues the live trader behind this job)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intraday-trader
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TZ: Asia/Kolkata
+    steps:
+      - name: Refuse to run during market hours
+        if: ${{ inputs.allow_market_hours != true }}
+        run: |
+          set -euo pipefail
+          dow=$(date +%u); hm=$(date +%H%M)
+          echo "IST now: $(date '+%Y-%m-%d %H:%M %A')"
+          if [ "$dow" -le 5 ] && [ "$hm" -ge 0915 ] && [ "$hm" -le 1530 ]; then
+            echo "::error::09:15-15:30 IST on a trading day. This job shares the"
+            echo "::error::'intraday-trader' concurrency group, so running now would"
+            echo "::error::queue the live trader behind a ~10 minute backfill."
+            exit 1
+          fi
+          echo "Outside market hours - proceeding."
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: backtest-machine/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r backtest-machine/requirements.txt
+
+      - name: Backfill, validate coverage and adjustment, re-run the control
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+          GATE_VERDICT: ${{ inputs.gate_verdict }}
+          BACKFILL_YEARS: ${{ inputs.years }}
+          RESEARCH_OUT: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          cd backtest-machine
+          python angel_backfill_5m.py
+
+      # `always()`: a partial corpus from a failed run is still the evidence
+      # for what failed, and re-fetching it costs another 9 minutes.
+      - name: Upload the research corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: angel-corpus-5m
+          path: ${{ runner.temp }}/angel_corpus_5m.db
+          retention-days: 90
+          if-no-files-found: warn
+
+      # Deliberately NO state restore, NO state save, NO dashboard publish.

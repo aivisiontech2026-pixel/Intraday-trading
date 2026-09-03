@@ -1,0 +1,101 @@
+name: Angel Gate - direction agreement (read only)
+
+# Answers ONE question, before any backfill is attempted:
+#   at the instants the harness makes decisions, do Angel One and yfinance
+#   produce the SAME signal direction?
+#
+# The decision rule is pre-stated inside the script and printed before the
+# number is computed:  >=99% interchangeable | 95-99% Angel-only | <95% stop.
+#
+# WHY THIS IS SAFE
+#   * READ ONLY. It reads candles and prints. No order, no trading call, no
+#     state write, no dashboard publish, no production database.
+#   * `permissions: contents: read` - structurally unable to write to the
+#     repository, so it cannot touch trading-state or gh-pages.
+#   * workflow_dispatch ONLY. No push trigger.
+#
+# GETTING THE DATA OUT: ARTIFACT, NOT A BRANCH.
+#   The Angel bars are uploaded as a run artifact. A research branch was
+#   rejected: it needs `contents: write`, and write access is precisely the
+#   capability that must not exist in a workflow living beside the live
+#   trader's state branches. This repository is also PUBLIC, so a research
+#   branch would permanently publish the corpus and grow every clone.
+#   Nothing here depends on downloading the artifact - every conclusion is
+#   computed on the runner and printed to the log.
+#
+# TIMING: the in-job clock check below refuses to run during market hours.
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_market_hours:
+        description: 'Run even during 09:15-15:30 IST (queues the live trader behind this job)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # SAME group as the trader: research must never overlap a live cycle.
+  group: intraday-trader
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Kolkata
+    steps:
+      - name: Refuse to run during market hours
+        if: ${{ inputs.allow_market_hours != true }}
+        run: |
+          set -euo pipefail
+          dow=$(date +%u); hm=$(date +%H%M)
+          echo "IST now: $(date '+%Y-%m-%d %H:%M %A')"
+          if [ "$dow" -le 5 ] && [ "$hm" -ge 0915 ] && [ "$hm" -le 1530 ]; then
+            echo "::error::09:15-15:30 IST on a trading day. This job shares the"
+            echo "::error::'intraday-trader' concurrency group, so running now would"
+            echo "::error::queue the live trader behind it. Re-dispatch after 15:30,"
+            echo "::error::or set allow_market_hours if that is genuinely intended."
+            exit 1
+          fi
+          echo "Outside market hours - proceeding."
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: backtest-machine/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r backtest-machine/requirements.txt
+
+      - name: Run the direction-agreement gate
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+          RESEARCH_OUT: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          cd backtest-machine
+          python angel_gate_direction.py
+
+      # `always()`: a gate that STOPS still produced the bars that justify
+      # the stop, and those are the ones worth keeping.
+      - name: Upload Angel overlap bars
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: angel-5m-overlap
+          path: ${{ runner.temp }}/angel_5m_overlap.db
+          retention-days: 30
+          if-no-files-found: warn
+
+      # Deliberately NO state restore, NO state save, NO dashboard publish.
