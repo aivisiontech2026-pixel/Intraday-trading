@@ -39,6 +39,14 @@ name: Angel Backfill - 3y of 5-minute bars (read only)
 on:
   workflow_dispatch:
     inputs:
+      task:
+        description: 'Which run: the 5-minute backfill, or the hourly control cell'
+        required: true
+        type: choice
+        default: backfill_5m
+        options:
+          - backfill_5m
+          - control_1h
       gate_verdict:
         description: 'Verdict printed by the direction-agreement gate'
         required: true
@@ -97,7 +105,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r backtest-machine/requirements.txt
 
-      - name: Backfill, validate coverage and adjustment, re-run the control
+      - name: Run the selected task
         env:
           ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
           ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
@@ -106,10 +114,15 @@ jobs:
           GATE_VERDICT: ${{ inputs.gate_verdict }}
           BACKFILL_YEARS: ${{ inputs.years }}
           RESEARCH_OUT: ${{ runner.temp }}
+          TASK: ${{ inputs.task }}
         run: |
           set -o pipefail
           cd backtest-machine
-          python angel_backfill_5m.py
+          if [ "$TASK" = "control_1h" ]; then
+            python angel_control_1h.py
+          else
+            python angel_backfill_5m.py
+          fi
 
       # `always()`: a partial corpus from a failed run is still the evidence
       # for what failed, and re-fetching it costs another 9 minutes.
@@ -117,8 +130,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: angel-corpus-5m
-          path: ${{ runner.temp }}/angel_corpus_5m.db
+          name: angel-corpus-${{ inputs.task }}
+          path: ${{ runner.temp }}/angel_corpus_*.db
           retention-days: 90
           if-no-files-found: warn
 

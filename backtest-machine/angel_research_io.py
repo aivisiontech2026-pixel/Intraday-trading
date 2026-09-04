@@ -166,7 +166,8 @@ def fetch_range(smart, exch, token, interval, start, end, bar_minutes=5,
             time.sleep(1.5 * (2 ** attempt))       # 1.5, 3, 6, 12 s
         span = {"from": cursor.isoformat(timespec="minutes"),
                 "to": req_to.isoformat(timespec="minutes"),
-                "n": 0, "last_ts": None, "truncated": False, "error": err}
+                "n": 0, "last_ts": None, "truncated": False,
+                "exhausted": False, "error": err}
 
         if err is not None:
             # Four attempts failed. Record the hole and step past it - one
@@ -204,12 +205,43 @@ def fetch_range(smart, exch, token, interval, start, end, bar_minutes=5,
                 f"-> {len(got)} rows, stopped at {last:%Y-%m-%d %H:%M}; "
                 f"re-requesting the remainder")
 
+        # EXHAUSTION vs A STUCK SERVER. These look identical from the cursor
+        # (neither advances) but mean opposite things, and the first run
+        # conflated them: the final chunk of every symbol reaches the current
+        # incomplete session, the response carries nothing after the cursor,
+        # and that was logged as "NO PROGRESS" - an error span for what is
+        # simply the end of the data. It cost nothing (744/744 sessions were
+        # still complete) but it recurs on every run and it makes a clean run
+        # look like a damaged one.
+        #
+        # The two are separable by asking whether the response contained any
+        # bar STRICTLY AFTER the cursor. None at all, having already returned
+        # data, is exhaustion. Genuine pathology - a server repeating one bar
+        # forever - is still caught, by the request budget and by the coverage
+        # report, which lists missing sessions from the data rather than from
+        # this loop's opinion of it.
+        if last <= cursor:
+            span["exhausted"] = True
+            # Exhaustion is benign ONLY if it happens at the end of the
+            # requested window. Stopping far short is the signature of a
+            # server repeating one bar, and that must not be filed as "no
+            # more data" - it would hand back a corpus of one session and
+            # call it complete.
+            short_by = end - last
+            if short_by > timedelta(days=7):
+                span["error"] = (f"EXHAUSTED {short_by.days} DAYS SHORT of the "
+                                 f"requested end - not end-of-data")
+            if log:
+                log(f"      end of data at {last:%Y-%m-%d %H:%M} "
+                    f"(requested to {end:%Y-%m-%d %H:%M})"
+                    f"{' - SHORT, flagged' if span['error'] else ' - not an error'}")
+            break
         nxt = last + bar
         if nxt <= cursor:
             spans.append({"from": cursor.isoformat(timespec="minutes"),
                           "to": req_to.isoformat(timespec="minutes"),
                           "n": 0, "last_ts": span["last_ts"],
-                          "truncated": True,
+                          "truncated": True, "exhausted": False,
                           "error": "NO PROGRESS - cursor would not advance"})
             break
         cursor = nxt
@@ -217,7 +249,7 @@ def fetch_range(smart, exch, token, interval, start, end, bar_minutes=5,
     if n_req >= max_requests and cursor <= end:
         spans.append({"from": cursor.isoformat(timespec="minutes"),
                       "to": end.isoformat(timespec="minutes"), "n": 0,
-                      "last_ts": None, "truncated": True,
+                      "last_ts": None, "truncated": True, "exhausted": False,
                       "error": f"REQUEST BUDGET EXHAUSTED after {n_req}"})
     rows.sort(key=lambda x: x[0])
     return rows, spans

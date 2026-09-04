@@ -259,20 +259,38 @@ def coverage(conn):
 
 # --------------------------------------------------------- adjustment ---
 def adjustment(conn):
-    """Are Angel's historical prices split-adjusted, or raw as-traded?
+    """Are Angel's historical prices split-adjusted?
 
-    This decides whether a 3-year series is usable as-is. An UNADJUSTED
-    series contains a 50% overnight 'move' on a bonus date that is not a
-    move at all; a signal test that ate one would score it as a real event.
+    CORRECTED 2026-09-04. The first run of this function reported "RAW" and
+    warned that the series "contains real split discontinuities" which "must
+    be adjusted out". That conclusion was wrong and acting on it would have
+    INTRODUCED fictitious 50% moves into an already-clean series.
 
-    Two independent tests, because either alone can mislead:
-      A. LEVEL - compare Angel's close on an old session against yfinance's
-         raw (auto_adjust=False) and adjusted (auto_adjust=True) daily close
-         for that same session. Whichever it tracks is the answer.
-      B. DISCONTINUITY - at each corporate action yfinance reports for this
-         universe, measure Angel's own close-to-close ratio across the
-         action date. A raw series steps by the ratio; an adjusted one does
-         not move.
+    The error was in the LEVEL test's premise, not its data. yfinance's
+    `Close` column is ALWAYS split-adjusted; `auto_adjust` controls DIVIDEND
+    adjustment only. Verified in the installed source (yfinance 1.5.1):
+    `utils.auto_adjust()` computes `ratio = Adj Close / Close` and rescales
+    OHLC by it - nothing else. Measured across all 18 stocks, that ratio runs
+    0.858 to 0.998: dividend scale, never the 0.5 or 2.0 a split would show.
+    So the level test compared Angel against two series that are BOTH
+    split-adjusted, and could never have detected split adjustment. What it
+    actually measured was dividend treatment - and it was mislabelled "RAW".
+
+    Its data was in fact exact: Angel returned 787.45 for HDFCBANK at the
+    corpus start, and yfinance's auto_adjust=False Close for that session is
+    787.45 to the paisa.
+
+    So the two tests never disagreed. Both say split-adjusted.
+
+      A. LEVEL - decides DIVIDEND treatment only. Angel vs yfinance's
+         auto_adjust=False Close (split-adj, dividend-unadj) and
+         auto_adjust=True Close (split-adj, dividend-adj).
+      B. DISCONTINUITY - DECIDES THE SPLIT QUESTION, and is the only test
+         that can. At each corporate action, measure Angel's own
+         close-to-close ratio across the date. A split-unadjusted series
+         steps by the ratio; an adjusted one does not move.
+
+    B OUTRANKS A. It is not a vote.
     """
     print("\n" + "=" * 78)
     print("ADJUSTMENT - are Angel's prices adjusted or raw?")
@@ -314,7 +332,7 @@ def adjustment(conn):
             continue
         r0, a0 = float(raw["Close"].iloc[0]), float(adj["Close"].iloc[0])
         dr, da = abs(a - r0) / r0, abs(a - a0) / a0
-        who = "RAW" if dr < da else "ADJUSTED"
+        who = "DIV-UNADJUSTED" if dr < da else "DIV-ADJUSTED"
         if min(dr, da) > 0.02:
             who = "NEITHER(>2%)"
         votes[who] += 1
@@ -342,12 +360,13 @@ def adjustment(conn):
             if not before or not after or not after[0]:
                 continue
             step = before[0] / after[0]
-            reads = ("RAW (step matches the ratio)"
+            reads = ("SPLIT-UNADJUSTED (step matches the ratio)"
                      if abs(step - float(ratio)) < 0.15 * float(ratio)
-                     else "ADJUSTED (no step)" if abs(step - 1.0) < 0.15
+                     else "SPLIT-ADJUSTED (no step)" if abs(step - 1.0) < 0.15
                      else "AMBIGUOUS")
-            votes["RAW" if "RAW" in reads else
-                  "ADJUSTED" if "ADJUSTED" in reads else "AMBIGUOUS"] += 1
+            split_votes["SPLIT-UNADJUSTED" if "UNADJ" in reads else
+                        "SPLIT-ADJUSTED" if "SPLIT-ADJ" in reads
+                        else "AMBIGUOUS"] += 1
             print(f"     {s:<12} {day:<12} {float(ratio):>7.3f} "
                   f"{step:>11.3f}  {reads}")
 
