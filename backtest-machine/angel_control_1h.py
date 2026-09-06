@@ -52,6 +52,11 @@ import pandas as pd
 import angelone_client as angel
 import angel_research_io as aio
 
+# The SDK's own logger prints request headers - the API key on every
+# AB1012, the Bearer JWT on network errors - through logzero, which this
+# module does not own. Arm the redactor before anything can fail.
+aio.install_log_scrubber()
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CFG = json.load(open(os.path.join(HERE, "intraday_config.json")))
 STOCKS = [s.replace(".NS", "") for s in CFG.get("symbols", [])]
@@ -139,6 +144,7 @@ def main():
     print()
 
     smart = angel.login()
+    aio.install_log_scrubber(smart)
     if smart is None:
         print("LOGIN FAILED. (No credential is printed.)")
         return 2

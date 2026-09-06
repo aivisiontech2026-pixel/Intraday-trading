@@ -1,0 +1,109 @@
+name: Angel OI Retention Probe (read only)
+
+# Phase 3B-0.1. The first OI probe established that Angel serves intraday
+# open interest, per contract, at ONE_MINUTE..ONE_HOUR, bar-open. RETENTION
+# was left unknown, because an empty response has three causes that look
+# identical: the contract did not exist yet (A), the API no longer serves it
+# (B), or it carried no open interest (C).
+#
+# This probe separates them by firing the SAME window at getCandleData on the
+# SAME token. Candles present with OI absent means the contract existed and
+# traded and only OI is missing - A and C excluded, retention established.
+# Where the paired candle call also returns nothing, the result is reported
+# as INDETERMINATE rather than as retention.
+#
+# INVENTORY ONLY. No signal, no correlation, no hit rate, no return, no
+# strategy, no stored data.
+#
+# WHY THIS IS SAFE
+#   * READ ONLY. getOIData and getCandleData; counts, stamps and statuses are
+#     printed. No order, no trading call, no state write, no dashboard
+#     publish, no production database, no artifact.
+#   * `permissions: contents: read` - structurally unable to write to the
+#     repository, so it cannot touch trading-state or gh-pages.
+#   * workflow_dispatch ONLY. No `push:` trigger, no schedule.
+#
+# CREDENTIAL HYGIENE - AND A REAL LEAK THIS CLOSES
+#   SmartApi.smartConnect logs request headers on failure:
+#     logger.error(f"... Headers: {headers}, Request: {params} ...")
+#     logger.error(f"... Headers: {self.requestHeaders()}, Request: {params}")
+#   The first carries `Authorization: Bearer <access token>`, the second
+#   carries `X-PrivateKey: <api key>`, and the SECOND fires on every response
+#   with status False - every AB1012. This probe deliberately provokes those,
+#   so unpatched it would print credentials on every failed request into a
+#   PUBLIC repository's log. That `logger` is logzero's default logger, which
+#   writes straight to stderr through its own handler, so neither logging
+#   levels nor root handlers intercept it.
+#   angel_research_io.install_log_scrubber() silences it by name AND wraps
+#   both streams with a redactor covering the known secret values, the Bearer
+#   pattern and the JWT pattern. It is armed before login and re-armed after,
+#   so the runtime access token joins the redaction set. GitHub masks
+#   registered secrets, but that JWT is minted at run time and is not one.
+#
+# TIMING
+#   The first step REFUSES to run between 09:15 and 15:30 IST in code, not by
+#   comment. This job joins the trader's concurrency group, so a run started
+#   during the session would queue the live trader behind it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_market_hours:
+        description: 'Run even during 09:15-15:30 IST (queues the live trader behind this job)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intraday-trader
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      TZ: Asia/Kolkata
+    steps:
+      - name: Refuse to run during market hours
+        if: ${{ inputs.allow_market_hours != true }}
+        run: |
+          set -euo pipefail
+          dow=$(date +%u); hm=$(date +%H%M)
+          echo "IST now: $(date '+%Y-%m-%d %H:%M %A')"
+          if [ "$dow" -le 5 ] && [ "$hm" -ge 0915 ] && [ "$hm" -le 1530 ]; then
+            echo "::error::09:15-15:30 IST on a trading day. This job shares the"
+            echo "::error::'intraday-trader' concurrency group, so running now would"
+            echo "::error::queue the live trader behind it. Re-dispatch after 15:30."
+            exit 1
+          fi
+          echo "Outside market hours - proceeding."
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: backtest-machine/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r backtest-machine/requirements.txt
+
+      - name: Probe getOIData retention
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+        run: |
+          set -o pipefail
+          cd backtest-machine
+          python angel_oi_retention_probe.py
+
+      # Deliberately NO state restore, NO state save, NO dashboard publish,
+      # NO artifact - the probe's entire output is the log.

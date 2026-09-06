@@ -45,6 +45,12 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 import angelone_client as angel
 
+# The SDK's own logger prints request headers - the API key on every
+# AB1012, the Bearer JWT on network errors - through logzero, which this
+# module does not own. Arm the redactor before anything can fail.
+import angel_research_io as aio
+aio.install_log_scrubber()
+
 SCRIP_URL = ("https://margincalculator.angelone.in/OpenAPI_File/files/"
              "OpenAPIScripMaster.json")
 _SCRUB = re.compile(r"[A-Za-z0-9_\-]{20,}")
@@ -156,6 +162,7 @@ def main():
     print("=" * 78)
 
     smart = angel.login()
+    aio.install_log_scrubber(smart)
     if smart is None:
         print("\nLOGIN FAILED. (No credential value is printed.)")
         return 2

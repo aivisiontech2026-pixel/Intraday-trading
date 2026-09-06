@@ -21,6 +21,7 @@ WHAT THIS MODULE DOES NOT DO
 import json
 import os
 import re
+import sys
 import time
 import urllib.request
 from datetime import datetime, timedelta
@@ -53,6 +54,94 @@ def safe(e, n=200):
     s = str(e) if not isinstance(e, BaseException) else \
         f"{type(e).__name__}: {e}"
     return _SCRUB.sub("<redacted>", s)[:n]
+
+
+# --------------------------------------------------- SDK LOG REDACTION ---
+# The SDK leaks credentials on its own, through a logger this code does not
+# own, and safe() cannot reach it. In SmartApi.smartConnect:
+#
+#   logger.error(f"... Headers: {headers}, Request: {params}, Response: {e}")
+#   logger.error(f"... Headers: {self.requestHeaders()}, Request: {params} ...")
+#
+# `headers` carries Authorization: Bearer <access token>; requestHeaders()
+# carries X-PrivateKey: <api key>. The SECOND fires on every response with
+# status False - every AB1012 - so any probe that deliberately provokes
+# failures prints credentials on every one.
+#
+# `logger` there is logzero's default logger, not the module's own `log`. It
+# writes straight to stderr through its own handler, so neither
+# logging.getLogger() level changes nor root handlers intercept it -
+# confirmed by capture test. It must be neutralised by name.
+#
+# GitHub masks registered secrets, but the Bearer JWT is minted at runtime by
+# generateSession and is not a registered secret, so masking does not cover
+# it. This repository is public.
+_JWT = re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{6,}")
+_BEARER = re.compile(r"(?i)(Bearer\s+)\S+")
+_HDRKEY = re.compile(r"(?i)(['\"]?X-(?:PrivateKey|ClientLocalIP|ClientPublicIP|"
+                     r"MACAddress)['\"]?\s*[:=]\s*)['\"]?[^,'\"}\s]+")
+
+
+class _Scrubbed:
+    """Stream wrapper that redacts known secrets and credential shapes."""
+
+    def __init__(self, stream, secrets):
+        self._s = stream
+        self._secrets = sorted(secrets, key=len, reverse=True)
+
+    def write(self, text):
+        for v in self._secrets:
+            if v and v in text:
+                text = text.replace(v, "<redacted>")
+        text = _JWT.sub("<redacted-jwt>", text)
+        text = _BEARER.sub(r"\1<redacted>", text)
+        text = _HDRKEY.sub(r"\1<redacted>", text)
+        return self._s.write(text)
+
+    def flush(self):
+        return self._s.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._s, name)
+
+
+def install_log_scrubber(smart=None):
+    """Silence the SDK's credential-printing logger and redact both streams.
+
+    Call once at startup, and again after login so the runtime tokens join
+    the redaction set. Belt and braces on purpose: the logger is silenced by
+    name AND the streams are wrapped, because the wrapper keeps working if a
+    future SDK version logs through something else.
+    """
+    import logging
+    secrets = set()
+    for k in ("ANGEL_API_KEY", "ANGEL_CLIENT_CODE", "ANGEL_PIN",
+              "ANGEL_TOTP_SECRET"):
+        v = os.environ.get(k)
+        if v and len(v) >= 4:
+            secrets.add(v)
+    for attr in ("access_token", "refresh_token", "feed_token"):
+        v = getattr(smart, attr, None) if smart is not None else None
+        if isinstance(v, str) and len(v) >= 8:
+            secrets.add(v)
+    try:
+        import SmartApi.smartConnect as sc
+        for nm in ("logger", "log"):
+            lg = getattr(sc, nm, None)
+            if lg is None:
+                continue
+            for h in list(getattr(lg, "handlers", [])):
+                lg.removeHandler(h)
+            lg.addHandler(logging.NullHandler())
+            lg.setLevel(logging.CRITICAL + 1)
+            lg.propagate = False
+    except Exception:
+        pass
+    for nm in ("stdout", "stderr"):
+        cur = getattr(sys, nm)
+        base = cur._s if isinstance(cur, _Scrubbed) else cur
+        setattr(sys, nm, _Scrubbed(base, secrets))
+    return len(secrets)
 
 
 def _throttle():
