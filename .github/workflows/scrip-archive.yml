@@ -1,0 +1,138 @@
+name: Scrip Master Token Archive (no credentials)
+
+# TASK A. Preserve scrip-master tokens BEFORE they expire.
+#
+# Phase 3B-1 established that Angel retains history for 365+ days, but
+# retention only means the API will serve a contract you can NAME. The master
+# is a live snapshot; once a contract expires its token is gone from every
+# accessible source, and a token is an opaque exchange integer that cannot be
+# derived from a symbol. 6,921 of 140,040 contracts are addressable today, and
+# every day this does not run another few hundred become permanently
+# unreachable. Verified locally: one simulated expiry day retired 246 NIFTY
+# tokens at once.
+#
+# NO CREDENTIALS. The scrip master is a public unauthenticated endpoint. This
+# workflow passes NO ANGEL_* secret and scrip_archive.py never reads one. That
+# is what makes it safe for this job to hold a write token at all - it holds a
+# write credential OR the Angel credentials, never both.
+#
+# PERMISSIONS ON THIS REPOSITORY: contents: read. It never writes here.
+# `trading-state` and `gh-pages` are structurally out of reach.
+#
+# WHERE THE ARCHIVE GOES, and why not here.
+#   An artifact expires, so an artifact is not an archive.
+#   A research branch in THIS repository needs contents: write, which must not
+#   exist in a workflow sitting beside the trader's state branches.
+#   So the archive lives in a SEPARATE REPOSITORY, written with a fine-grained
+#   PAT scoped to that one repository and nothing else. Blast radius is one
+#   repo that holds only market metadata.
+#
+#   Configure two things, then this becomes durable:
+#     secrets.ARCHIVE_REPO_TOKEN  fine-grained PAT, Contents: read+write,
+#                                 scoped to the archive repository ONLY
+#     vars.ARCHIVE_REPO           e.g. your-account/scrip-archive
+#
+#   Until they are set the job still runs, still reports, and uploads the
+#   registry as a 90-day artifact - but it CANNOT compute day-over-day deltas,
+#   because it has no yesterday to compare against. The fallback exists to
+#   prove the workflow works, not to preserve anything.
+#
+# SCHEDULE: 11:00 UTC = 16:30 IST, daily. After the 15:30 close and the
+# closing auction, so the master is final for the day, and far outside
+# 09:15-15:30. Daily rather than weekday-only so a Monday expiry is never
+# missed because Friday's run failed.
+#
+# CONCURRENCY: its own group. It shares no resource with the trader - no Angel
+# session, no rate limit, no state - so putting it in `intraday-trader` would
+# only risk queueing the trader behind it for no benefit.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: '0 11 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scrip-archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: Asia/Kolkata
+      ARCHIVE_REPO: ${{ vars.ARCHIVE_REPO }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Fetch the existing registry from the archive repository
+        id: pull
+        run: |
+          set -uo pipefail
+          if [ -z "${ARCHIVE_REPO:-}" ] || [ -z "${ARCHIVE_TOKEN:-}" ]; then
+            echo "::warning::ARCHIVE_REPO / ARCHIVE_REPO_TOKEN not configured."
+            echo "::warning::Running in REPORT-ONLY mode - nothing is preserved,"
+            echo "::warning::and deltas cannot be computed without a prior registry."
+            echo "durable=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          URL="https://x-access-token:${ARCHIVE_TOKEN}@github.com/${ARCHIVE_REPO}.git"
+          if git clone --depth 1 "$URL" archive 2>/dev/null; then
+            echo "cloned existing archive"
+          else
+            # First ever run, or the repo is empty. `git init` alone leaves no
+            # `origin`, so the later push would fail with "'origin' does not
+            # appear to be a git repository" - add the remote explicitly.
+            echo "no existing archive - initialising"
+            mkdir -p archive
+            git -C archive init -q
+            git -C archive remote add origin "$URL"
+          fi
+          echo "durable=true" >> "$GITHUB_OUTPUT"
+          # The URL embeds the token, so list files rather than remotes.
+          ls -la archive || true
+        env:
+          ARCHIVE_TOKEN: ${{ secrets.ARCHIVE_REPO_TOKEN }}
+
+      - name: Update the token registry
+        run: |
+          set -o pipefail
+          mkdir -p archive
+          python backtest-machine/scrip_archive.py \
+            --db archive/scrip_token_registry.db
+
+      - name: Commit and push the archive
+        if: steps.pull.outputs.durable == 'true'
+        run: |
+          set -euo pipefail
+          cd archive
+          git config user.name  "scrip-archive-bot"
+          git config user.email "noreply@github.com"
+          git add -A scrip_token_registry.db
+          if git diff --cached --quiet; then
+            echo "registry unchanged - nothing to commit (a same-day re-run)"
+            exit 0
+          fi
+          git commit -q -m "scrip registry $(date +%F)"
+          git push origin HEAD:main
+        env:
+          ARCHIVE_TOKEN: ${{ secrets.ARCHIVE_REPO_TOKEN }}
+
+      # Always, so a run is never wasted even in report-only mode.
+      - name: Upload the registry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrip-token-registry
+          path: archive/scrip_token_registry.db
+          retention-days: 90
+          if-no-files-found: warn
