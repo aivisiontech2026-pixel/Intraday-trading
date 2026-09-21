@@ -39,10 +39,19 @@ name: Scrip Master Token Archive (no credentials)
 #
 # VERIFICATION CONTRACT (added after two diagnostic cycles)
 #   A green run is NOT a pass. The push step prints the local commit SHA, the
-#   push output, and an independent `git ls-remote` of the target branch, and
-#   FAILS the run unless the remote branch carries exactly that SHA. An auth
-#   failure can no longer masquerade as an empty first-run repository, and the
-#   target branch is resolved from the remote rather than hardcoded.
+#   push output, and an independent `git ls-remote` of the target branch. An
+#   auth failure can no longer masquerade as an empty first-run repository,
+#   and the target branch is resolved from the remote rather than hardcoded.
+#
+# FAIL LAST, NOT FIRST
+#   Loudness must never cost data. The day's snapshot is the one thing that
+#   cannot be recovered afterwards, so the order is: fetch (never aborts) ->
+#   BUILD the snapshot -> UPLOAD the artifact -> attempt the push -> and only
+#   then a final gate that turns the run RED. An unreachable archive
+#   repository therefore costs one day-over-day comparison, not the snapshot.
+#   The first version of this fix had it backwards: `exit 1` in the fetch step
+#   skipped the build (GitHub's default step condition is success()), leaving
+#   nothing on disk for `if: always()` to upload.
 #
 # SCHEDULE: 11:00 UTC = 16:30 IST, daily. After the 15:30 close and the
 # closing auction, so the master is final for the day, and far outside
@@ -102,9 +111,15 @@ jobs:
             echo "::warning::and deltas cannot be computed without a prior registry."
             echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "have_archive=false" >> "$GITHUB_OUTPUT"
+            echo "fetch_ok=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "configured=true" >> "$GITHUB_OUTPUT"
+          # A repository NAME is not a credential. GitHub masks secrets in logs
+          # and does not mask variables, precisely because variables are not
+          # secret. Printing it lets the run answer the wrong-repo question in
+          # its own log instead of by eye. The TOKEN is never printed.
+          echo "archive target: ${ARCHIVE_REPO}"
           URL="https://x-access-token:${ARCHIVE_TOKEN}@github.com/${ARCHIVE_REPO}.git"
 
           # Capture stderr rather than discarding it. It is NEVER printed raw:
@@ -139,15 +154,27 @@ jobs:
             git -C archive remote add origin "$URL"
             echo "have_archive=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::error::git clone FAILED for a reason other than an empty"
-            echo "::error::repository. This is NOT a first run, and initialising"
-            echo "::error::here would push an unrelated history over the archive."
-            echo "::error::clone said: $SAFE"
-            echo "::error::Most likely: the PAT is wrong, expired, lacks"
-            echo "::error::Contents read+write, or does not have the archive repo"
-            echo "::error::selected under 'Only select repositories'."
-            exit 1
+            # FAIL LAST, NOT FIRST. Aborting here would skip the registry
+            # build (GitHub's default step condition is success()), leaving
+            # nothing on disk for the artifact upload to preserve - so a wrong
+            # ARCHIVE_REPO would cost the DAY'S SNAPSHOT, not just the push.
+            # Record the failure, carry on, and let the final step go red.
+            echo "::warning::git clone FAILED for a reason other than an empty"
+            echo "::warning::repository. This is NOT a first run, and initialising"
+            echo "::warning::here would push an unrelated history over the archive."
+            echo "::warning::clone said: $SAFE"
+            echo "::warning::Most likely: the PAT is wrong, expired, lacks"
+            echo "::warning::Contents read+write, or does not have the archive repo"
+            echo "::warning::selected under 'Only select repositories'."
+            echo "::warning::CONTINUING so the day's snapshot is still built and"
+            echo "::warning::uploaded. The job will be failed at the end."
+            echo "fetch_ok=false" >> "$GITHUB_OUTPUT"
+            echo "have_archive=false" >> "$GITHUB_OUTPUT"
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            mkdir -p archive
+            exit 0
           fi
+          echo "fetch_ok=true" >> "$GITHUB_OUTPUT"
 
           # (b) Resolve the archive repo's ACTUAL default branch. The old code
           #     hardcoded `main`; if the archive defaults to `master` that
@@ -170,18 +197,47 @@ jobs:
         env:
           ARCHIVE_TOKEN: ${{ secrets.ARCHIVE_REPO_TOKEN }}
 
+      # `always()` on purpose: the day's snapshot is the thing that cannot be
+      # recovered later, so it is built before anything else is allowed to fail.
       - name: Update the token registry
+        if: always()
         run: |
           set -o pipefail
+          if [ "${{ steps.pull.outputs.have_archive }}" != "true" ]; then
+            echo "NOTE: no prior archive was retrieved, so this run builds a"
+            echo "STANDALONE snapshot for today. The day-over-day 'disappeared'"
+            echo "comparison is not possible for this run - that is a loss of one"
+            echo "comparison, not a loss of the snapshot."
+          fi
           mkdir -p archive
           python backtest-machine/scrip_archive.py \
             --db archive/scrip_token_registry.db
+
+      # KEPT deliberately. It is the only durable copy that currently exists,
+      # and the per-run artifact SIZE SERIES was the single most informative
+      # piece of evidence in the push diagnosis. The confusion it caused came
+      # from the step name, not the upload - so the name is now unambiguous.
+      - name: Upload registry (belt-and-braces copy)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrip-token-registry
+          path: archive/scrip_token_registry.db
+          retention-days: 90
+          if-no-files-found: warn
 
       # (c) The log must carry PROOF of the commit, not an exit code. A green
       #     run without a confirmed SHA is not a pass, and the absence of this
       #     is what cost two diagnostic cycles.
       - name: Commit and push the archive
-        if: steps.pull.outputs.configured == 'true'
+        # success() must be stated explicitly: supplying any `if:` REPLACES
+        # GitHub's default success() condition, so without it this step would
+        # run even after an earlier step had failed.
+        if: >-
+          success()
+          && steps.pull.outputs.configured == 'true'
+          && steps.pull.outputs.fetch_ok == 'true'
+        id: push
         run: |
           set -euo pipefail
           BRANCH="${{ steps.pull.outputs.branch }}"
@@ -193,6 +249,7 @@ jobs:
             echo "registry unchanged - nothing to commit (a same-day re-run)"
             BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "none")
             echo "HEAD remains $BEFORE"
+            echo "pushed=unchanged" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git commit -q -m "scrip registry $(date +%F)"
@@ -224,18 +281,41 @@ jobs:
             exit 1
           fi
           echo "VERIFIED: $BRANCH on the archive repository is now $SHA"
+          echo "pushed=verified" >> "$GITHUB_OUTPUT"
         env:
           ARCHIVE_TOKEN: ${{ secrets.ARCHIVE_REPO_TOKEN }}
 
-      # KEPT deliberately. It is the only durable copy that currently exists,
-      # and the per-run artifact SIZE SERIES was the single most informative
-      # piece of evidence in the push diagnosis. The confusion it caused came
-      # from the step name, not the upload - so the name is now unambiguous.
-      - name: Upload registry (belt-and-braces copy)
+      # FAIL LAST. Everything irreplaceable - the day's snapshot and its
+      # artifact - is already done by the time this runs. This step exists
+      # only to make the run RED so the operator is alerted, never to prevent
+      # the preservation that precedes it.
+      - name: Final status gate
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: scrip-token-registry
-          path: archive/scrip_token_registry.db
-          retention-days: 90
-          if-no-files-found: warn
+        run: |
+          set -uo pipefail
+          CONFIGURED="${{ steps.pull.outputs.configured }}"
+          FETCH_OK="${{ steps.pull.outputs.fetch_ok }}"
+          PUSHED="${{ steps.push.outputs.pushed }}"
+          echo "configured=$CONFIGURED  fetch_ok=$FETCH_OK  pushed=$PUSHED"
+          if [ "$CONFIGURED" != "true" ]; then
+            echo "::warning::REPORT-ONLY: ARCHIVE_REPO / ARCHIVE_REPO_TOKEN are"
+            echo "::warning::not configured. The snapshot was built and uploaded"
+            echo "::warning::as an artifact, but nothing is durably preserved."
+            exit 0
+          fi
+          if [ "$FETCH_OK" != "true" ]; then
+            echo "::error::ARCHIVE FETCH FAILED. The day's snapshot WAS built and"
+            echo "::error::uploaded as an artifact, so nothing is lost today - but"
+            echo "::error::the archive repository was not reachable and the"
+            echo "::error::disappeared-token comparison could not be made."
+            echo "::error::Check the 'archive target:' line above against the"
+            echo "::error::repository you expect, and check the PAT's scope."
+            exit 1
+          fi
+          if [ "$PUSHED" != "verified" ] && [ "$PUSHED" != "unchanged" ]; then
+            echo "::error::PUSH NOT VERIFIED (pushed='$PUSHED'). The snapshot is"
+            echo "::error::safe in the artifact, but the archive repository does"
+            echo "::error::not provably carry it. A green run is not a pass."
+            exit 1
+          fi
+          echo "ARCHIVE OK - push $PUSHED"
