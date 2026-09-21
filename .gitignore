@@ -2,3 +2,12 @@ __pycache__/
 *.pyc
 backtest-machine/config.json
 backtest-machine/intraday_config.json
+
+# Research corpora and regenerable caches. These are large, they are rebuilt
+# from their sources, and this repository is PUBLIC - none of them should ever
+# be committed by accident.
+backtest-machine/angel_corpus_5m.db
+backtest-machine/angel_corpus_1h.db
+backtest-machine/angel_5m_overlap.db
+backtest-machine/scripmaster_cache.json
+backtest-machine/scrip_token_registry.db
