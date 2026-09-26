@@ -53,10 +53,51 @@ name: Scrip Master Token Archive (no credentials)
 #   skipped the build (GitHub's default step condition is success()), leaving
 #   nothing on disk for `if: always()` to upload.
 #
-# SCHEDULE: 11:00 UTC = 16:30 IST, daily. After the 15:30 close and the
+# SCHEDULE: 11:37 UTC = 17:07 IST, daily. After the 15:30 close and the
 # closing auction, so the master is final for the day, and far outside
 # 09:15-15:30. Daily rather than weekday-only so a Monday expiry is never
 # missed because Friday's run failed.
+#
+#   WHY 11:37 AND NOT 11:00. Measured firing times for runs #12-#17 were
+#   3.0-4.4 hours LATE against the 11:00 UTC cron. GitHub queues scheduled
+#   workflows and documents that the top of the hour is the most contended
+#   minute, recommending a different one. A workflow delayed far enough can
+#   be DROPPED for that interval rather than merely deferred, so this drift
+#   is not cosmetic - it is the symptom that precedes a missed run.
+#   HONEST CAVEAT: moving off :00 addresses the documented cause but its
+#   effect here is UNMEASURED. Treat it as a cheap, reasonable measure, not
+#   as a fix. The drift must be re-measured over the next several runs, and
+#   if it persists the schedule cannot be trusted for an expiry day at all.
+#   Even at the worst observed drift (+4.4 h) this lands 21:30 IST, still
+#   far outside 09:15-15:30 IST and still the same calendar day.
+#
+# MANUAL DISPATCH REQUIRED - 2026-09-29 AND 2026-09-30
+#   The September monthly expiry is Tuesday 2026-09-29 (~13,136 contracts).
+#   BOTH days must be dispatched by hand after 15:30 IST, regardless of
+#   whether the scheduled run appears to have fired, because the schedule is
+#   the one component here with a measured failure mode.
+#     2026-09-29  captures the expiring contracts while they are STILL
+#                 LISTED. Contracts remain in the master on their expiry
+#                 date; this is the last snapshot in which their tokens are
+#                 addressable at all.
+#     2026-09-30  is the snapshot whose day-over-day comparison RECORDS the
+#                 retirement - `disappeared` is computed against the prior
+#                 run, so without 09-30 the tokens are archived but their
+#                 retirement date is not.
+#   Both are needed because they answer different questions: 09-29 preserves
+#   the tokens, 09-30 timestamps their disappearance. Missing 09-29 loses
+#   ~13,136 tokens permanently. Missing 09-30 loses only the retirement
+#   record, which is recoverable from any later run's first-seen/last-seen.
+#
+#   A RED RUN ON 09-29 IS NOT SURVIVABLE BY ITSELF. Run #21 (2026-09-24)
+#   fetched and built cleanly and then FAILED at the push. That is benign on
+#   an ordinary day - the next run re-fetches the last pushed state and the
+#   only tokens lost are ones that vanished from the master in between. On an
+#   EXPIRY day it is the whole loss: the tokens that day preserves are exactly
+#   the ones absent from tomorrow's master. So on 09-29 and 09-30, if the run
+#   is RED, RE-DISPATCH until a `VERIFIED:` line appears. The 90-day artifact
+#   still holds that day's registry as a fallback, but it is a fallback, not
+#   the archive.
 #
 # CONCURRENCY: its own group. It shares no resource with the trader - no Angel
 # session, no rate limit, no state - so putting it in `intraday-trader` would
@@ -65,7 +106,7 @@ name: Scrip Master Token Archive (no credentials)
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: '0 11 * * *'
+    - cron: '37 11 * * *'        # 11:37 UTC = 17:07 IST - off the contended :00
 
 permissions:
   contents: read
