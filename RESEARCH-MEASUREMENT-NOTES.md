@@ -102,6 +102,7 @@ to resolve single-digit basis points. None was a near miss.
 | H1 opening-range breakout | -0.87 to +0.12 bps vs 27.4 bps | Phase 4A |
 | H2 volatility-normalised momentum | -0.21 to +0.93 bps vs 27.4 bps | Phase 4A |
 | H3 shock reversal | H2 with the sign flipped; same failure | Phase 4B |
+| cross-sectional relative strength | holdout IC -0.0097, corrected CI [-0.0679, +0.0486] | Phase 4C |
 
 **Three of these produced magnitude predictability with no directional
 content** — India VIX (Phase 3A), OI skew's absolute channel (3C), and H2's
