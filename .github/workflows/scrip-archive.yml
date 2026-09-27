@@ -72,26 +72,42 @@ name: Scrip Master Token Archive (no credentials)
 #   far outside 09:15-15:30 IST and still the same calendar day.
 #
 # EXPIRY-DAY CHECKLIST - 2026-09-29 AND 2026-09-30
-#   The September monthly expiry is Tuesday 2026-09-29 (~13,136 contracts).
+#   The September monthly expiry is Tuesday 2026-09-29. Measured against the
+#   scrip master itself, not assumed: 13,136 NFO/NSE contracts carry
+#   expiry 29SEP2026 (OPTSTK 11,430 / OPTIDX 1,490 / FUTSTK 210 / FUTIDX 6).
 #   Follow this as written; it needs no other document.
 #
-#   1. WHEN. Dispatch by hand on Tue 2026-09-29 and again on Wed 2026-09-30,
-#      any time after 15:30 IST, from Actions -> this workflow -> Run
-#      workflow. Do this REGARDLESS of whether the scheduled run appears to
-#      have fired. The schedule fires 3.0-4.4 hours late and is the one
-#      component here with a measured failure mode.
+#   0. PRECONDITION ON EVERY MANUAL DISPATCH. Open the Actions list first and
+#      dispatch ONLY when no run of this workflow is in progress AND none is
+#      pending. This workflow uses `concurrency: group: scrip-archive,
+#      cancel-in-progress: false`, so an overlapping run queues rather than
+#      races - but GitHub holds only ONE pending run per group, and a third
+#      trigger CANCELS the older pending one. An operator who dispatches
+#      impatiently can therefore cancel their own queued run and read the
+#      cancellation as a failure, which invites more clicking. If a run is
+#      running or queued, wait for it and read its result. Do not add another.
 #
-#   2. AVOID THE OVERLAP. The 17:07 IST cron is still armed. This workflow
-#      has `concurrency: group: scrip-archive, cancel-in-progress: false`, so
-#      an overlapping run QUEUES rather than races - two runs can never push
-#      at once. But a queued run is still a run, and a same-day second run is
-#      a no-op that reports `pushed=unchanged`. Simplest: WAIT for the
-#      scheduled run to finish (it lands 20:00-22:15 IST), read its result,
-#      and only dispatch if it is red or absent. If you would rather not
-#      wait, dispatch after 15:30 IST and let the scheduled run queue behind
-#      it - that is safe, just noisier. Do NOT disable the schedule: a
-#      disabled schedule that nobody re-enables is a worse failure than a
-#      duplicate run.
+#   1. WHEN. On 2026-09-29 and 2026-09-30, dispatch by hand at approximately
+#      20:00 IST, after the step-0 check. UNCONDITIONALLY - not "only if the
+#      scheduled run looks absent". The drift under `37 11` is unmeasured,
+#      and "absent" is a state you can only recognise after waiting long
+#      enough to be unsure. If the scheduled run already verified, the manual
+#      run finds the registry unchanged and reports `pushed=unchanged`, which
+#      is a pass costing nothing. If the schedule drifted or was dropped, the
+#      manual run IS the run. Either way that day has a verified run and
+#      nothing depends on when GitHub chose to fire the cron.
+#
+#      Why evening rather than straight after 15:30: all 23 runs to date
+#      fired between 19:32 and 22:11 IST and produced sane, monotonically
+#      growing registries, so that window is EMPIRICALLY known to work. The
+#      master's actual daily rollover time is NOT ESTABLISHED anywhere in
+#      this repository - treat 20:00 IST as a window with a track record,
+#      not as a derived deadline.
+#
+#   2. DO NOT DISABLE THE SCHEDULE for those two days. A disabled schedule
+#      that nobody re-enables is a worse failure than a duplicate run, and it
+#      is exactly the kind of thing that survives one expiry and kills the
+#      next. A duplicate run is a no-op.
 #
 #   3. WHAT SUCCESS LOOKS LIKE. One line, and only this line, means the
 #      archive provably carries the day:
@@ -101,34 +117,41 @@ name: Scrip Master Token Archive (no credentials)
 #      unchanged` are also a pass - the first run already did the work.
 #      A green run WITHOUT one of those lines is not a pass.
 #
-#   4. ON RED. Re-dispatch, and keep re-dispatching until a VERIFIED: line
-#      appears. The push now retries 3 times internally with a 5s/15s
-#      backoff, so a red push means the failure outlasted ~20 seconds.
-#      Wait a few minutes between manual retries and check
-#      githubstatus.com for a Git Operations incident.
+#   4. ON RED. Re-dispatch - subject to step 0 every time: only when nothing
+#      is running and nothing is pending. Keep going until a VERIFIED: line
+#      appears. The push already retries 3 times internally with a 5s/15s
+#      backoff, so a red push means the failure outlasted ~20 seconds. Space
+#      manual retries by minutes, not seconds, and check githubstatus.com for
+#      a Git Operations incident.
 #
 #   5. THE ARTIFACT IS A FALLBACK, NOT THE ARCHIVE. Every run uploads
 #      `scrip-token-registry` whether or not the push succeeds, and it is
 #      retained 90 days. If 09-29 ends red and cannot be made green, DOWNLOAD
 #      THAT ARTIFACT THE SAME WEEK. It expires; the archive branch does not.
 #
-#   WHY BOTH DAYS, and the asymmetry between them:
-#     2026-09-29  captures the expiring contracts while they are STILL
-#                 LISTED. Contracts remain in the master on their expiry
-#                 date; this is the last snapshot in which their tokens are
-#                 addressable at all. MISSING IT LOSES ~13,136 TOKENS
-#                 PERMANENTLY.
-#     2026-09-30  is the snapshot whose day-over-day comparison RECORDS the
+#   WHAT IS ACTUALLY AT STAKE, corrected. An earlier version of this note
+#   said missing 09-29 would lose ~13,136 tokens permanently. That was wrong,
+#   and overstating the stake is its own hazard. All 13,136 contracts
+#   expiring 29SEP2026 were already visible in the 2026-09-07 master - listed
+#   at least 22 days ahead - so every run since #1 has recorded their tokens
+#   already. Missing 09-29 costs:
+#     * the `last_seen` / retirement date for those 13,136 tokens, and
+#     * any strike FIRST LISTED between the last successful run and 09-29,
+#       which is the only genuinely unrecoverable part. New strikes are added
+#       as the underlying moves, so this set is non-empty but small, and
+#       skewed toward deep-OTM strikes.
+#   The permanent-loss scenario needs a GAP long enough that a contract is
+#   both listed and expired inside it - roughly a month, not a day. Daily
+#   running is what keeps that gap from opening; one missed day does not open
+#   it. Dispatch anyway: the cost of a duplicate run is zero.
+#
+#   WHY BOTH DAYS:
+#     2026-09-29  the last snapshot in which the expiring contracts are still
+#                 listed, and so the last chance to catch strikes added late.
+#     2026-09-30  the snapshot whose day-over-day comparison RECORDS the
 #                 retirement - `disappeared` is computed against the prior
 #                 run. Missing it loses only the retirement DATE, which is
 #                 recoverable from any later run's first_seen/last_seen.
-#
-#   A RED RUN ON 09-29 IS NOT SURVIVABLE BY ITSELF. Run #21 (2026-09-24)
-#   fetched and built cleanly, then failed at the push on a GitHub-side HTTP
-#   500. That is nearly free on an ordinary day - the next run re-fetches the
-#   last pushed state and the only tokens lost are ones that vanished from
-#   the master in between. On an EXPIRY day, "vanished in between" is exactly
-#   what the run exists to preserve.
 #
 # TODO 2026-10-01: remove the `archive target: ${ARCHIVE_REPO}` echo in the
 #   fetch step. It is a deliberate, time-boxed disclosure - this repository is
