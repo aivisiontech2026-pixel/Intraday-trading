@@ -73,11 +73,17 @@ clustered SE dominates.
 ```
 after Phase 3C    61
 after Phase 4A    69
+after Phase 4C    71
 ```
 
-At 69 tests, z = 3.380. Going from 4 tests to 69 moves z from 2.50 to 3.38 —
-about 0.9 of a standard error, which is small next to the clustering
-correction it sits beside.
+Phase 4C's two cells are the primary cross-sectional IC and the secondary
+ranked top-5 minus bottom-5 spread, both pre-declared in its frozen v11
+pre-registration. Its five verdict labels partition one two-sided test's
+outcome space and do not add cells.
+
+At 69 tests, z = 3.380; at 71, z = 3.388. Going from 4 tests to 71 moves z
+from 2.50 to 3.39 — about 0.9 of a standard error, which is small next to the
+clustering correction it sits beside.
 
 ---
 
