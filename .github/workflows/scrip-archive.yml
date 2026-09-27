@@ -71,33 +71,75 @@ name: Scrip Master Token Archive (no credentials)
 #   Even at the worst observed drift (+4.4 h) this lands 21:30 IST, still
 #   far outside 09:15-15:30 IST and still the same calendar day.
 #
-# MANUAL DISPATCH REQUIRED - 2026-09-29 AND 2026-09-30
+# EXPIRY-DAY CHECKLIST - 2026-09-29 AND 2026-09-30
 #   The September monthly expiry is Tuesday 2026-09-29 (~13,136 contracts).
-#   BOTH days must be dispatched by hand after 15:30 IST, regardless of
-#   whether the scheduled run appears to have fired, because the schedule is
-#   the one component here with a measured failure mode.
+#   Follow this as written; it needs no other document.
+#
+#   1. WHEN. Dispatch by hand on Tue 2026-09-29 and again on Wed 2026-09-30,
+#      any time after 15:30 IST, from Actions -> this workflow -> Run
+#      workflow. Do this REGARDLESS of whether the scheduled run appears to
+#      have fired. The schedule fires 3.0-4.4 hours late and is the one
+#      component here with a measured failure mode.
+#
+#   2. AVOID THE OVERLAP. The 17:07 IST cron is still armed. This workflow
+#      has `concurrency: group: scrip-archive, cancel-in-progress: false`, so
+#      an overlapping run QUEUES rather than races - two runs can never push
+#      at once. But a queued run is still a run, and a same-day second run is
+#      a no-op that reports `pushed=unchanged`. Simplest: WAIT for the
+#      scheduled run to finish (it lands 20:00-22:15 IST), read its result,
+#      and only dispatch if it is red or absent. If you would rather not
+#      wait, dispatch after 15:30 IST and let the scheduled run queue behind
+#      it - that is safe, just noisier. Do NOT disable the schedule: a
+#      disabled schedule that nobody re-enables is a worse failure than a
+#      duplicate run.
+#
+#   3. WHAT SUCCESS LOOKS LIKE. One line, and only this line, means the
+#      archive provably carries the day:
+#          VERIFIED: main on the archive repository is now <sha>
+#      followed by `ARCHIVE OK - push verified`. On a same-day second run,
+#      `registry unchanged - nothing to commit` and `ARCHIVE OK - push
+#      unchanged` are also a pass - the first run already did the work.
+#      A green run WITHOUT one of those lines is not a pass.
+#
+#   4. ON RED. Re-dispatch, and keep re-dispatching until a VERIFIED: line
+#      appears. The push now retries 3 times internally with a 5s/15s
+#      backoff, so a red push means the failure outlasted ~20 seconds.
+#      Wait a few minutes between manual retries and check
+#      githubstatus.com for a Git Operations incident.
+#
+#   5. THE ARTIFACT IS A FALLBACK, NOT THE ARCHIVE. Every run uploads
+#      `scrip-token-registry` whether or not the push succeeds, and it is
+#      retained 90 days. If 09-29 ends red and cannot be made green, DOWNLOAD
+#      THAT ARTIFACT THE SAME WEEK. It expires; the archive branch does not.
+#
+#   WHY BOTH DAYS, and the asymmetry between them:
 #     2026-09-29  captures the expiring contracts while they are STILL
 #                 LISTED. Contracts remain in the master on their expiry
 #                 date; this is the last snapshot in which their tokens are
-#                 addressable at all.
+#                 addressable at all. MISSING IT LOSES ~13,136 TOKENS
+#                 PERMANENTLY.
 #     2026-09-30  is the snapshot whose day-over-day comparison RECORDS the
 #                 retirement - `disappeared` is computed against the prior
-#                 run, so without 09-30 the tokens are archived but their
-#                 retirement date is not.
-#   Both are needed because they answer different questions: 09-29 preserves
-#   the tokens, 09-30 timestamps their disappearance. Missing 09-29 loses
-#   ~13,136 tokens permanently. Missing 09-30 loses only the retirement
-#   record, which is recoverable from any later run's first-seen/last-seen.
+#                 run. Missing it loses only the retirement DATE, which is
+#                 recoverable from any later run's first_seen/last_seen.
 #
 #   A RED RUN ON 09-29 IS NOT SURVIVABLE BY ITSELF. Run #21 (2026-09-24)
-#   fetched and built cleanly and then FAILED at the push. That is benign on
-#   an ordinary day - the next run re-fetches the last pushed state and the
-#   only tokens lost are ones that vanished from the master in between. On an
-#   EXPIRY day it is the whole loss: the tokens that day preserves are exactly
-#   the ones absent from tomorrow's master. So on 09-29 and 09-30, if the run
-#   is RED, RE-DISPATCH until a `VERIFIED:` line appears. The 90-day artifact
-#   still holds that day's registry as a fallback, but it is a fallback, not
-#   the archive.
+#   fetched and built cleanly, then failed at the push on a GitHub-side HTTP
+#   500. That is nearly free on an ordinary day - the next run re-fetches the
+#   last pushed state and the only tokens lost are ones that vanished from
+#   the master in between. On an EXPIRY day, "vanished in between" is exactly
+#   what the run exists to preserve.
+#
+# TODO 2026-10-01: remove the `archive target: ${ARCHIVE_REPO}` echo in the
+#   fetch step. It is a deliberate, time-boxed disclosure - this repository is
+#   public, so that line publishes a private repository's name. It stays
+#   through the 09-29/09-30 expiry because a wrong-repo failure passes every
+#   other check silently, and the name is the only thing that catches it.
+#   After 2026-10-01 it has served its purpose and must come out. A
+#   fingerprint variant (sha256 prefix of the name) was proposed as a
+#   permanent replacement and DEFERRED; note that it is a tamper indicator,
+#   not a confidentiality measure - `owner/name` is low-entropy and a hash
+#   prefix of it is brute-forceable.
 #
 # CONCURRENCY: its own group. It shares no resource with the trader - no Angel
 # session, no rate limit, no state - so putting it in `intraday-trader` would
@@ -297,15 +339,43 @@ jobs:
           SHA=$(git rev-parse HEAD)
           echo "local commit: $SHA  -> pushing to '$BRANCH'"
 
-          set +e
-          POUT=$(git push origin "HEAD:$BRANCH" 2>&1); PRC=$?
-          set -e
-          PSAFE=$(printf '%s' "$POUT" | sed -e "s|${ARCHIVE_TOKEN}|<redacted>|g" \
-                                            -e 's|x-access-token:[^@]*@|<redacted>@|g')
-          echo "push said: $PSAFE"
+          # (d) BOUNDED RETRY. Run #21 (2026-09-24) failed on a GitHub-side
+          #     HTTP 500 from the receive side - not auth, not a
+          #     non-fast-forward, not a race. No declared GitHub incident
+          #     covered 15:35:36Z, so it was a brief unannounced blip rather
+          #     than an outage, which is exactly what a retry is for.
+          #
+          #     3 attempts, backoff 5s then 15s: ~20s of added latency in the
+          #     worst case, trivial against a 20-minute job timeout, and wide
+          #     enough to straddle a blip without pretending to ride out an
+          #     outage. NEVER --force, on any attempt: every try is the same
+          #     plain push, so a retry can only fast-forward, never overwrite.
+          #     Retries fire ONLY on a non-zero push exit. A verification
+          #     mismatch is a different condition and stays fatal, unretried.
+          ATTEMPTS=3
+          PRC=1
+          n=0
+          for WAIT in 5 15 ""; do
+            n=$((n+1))
+            set +e
+            POUT=$(git push origin "HEAD:$BRANCH" 2>&1); PRC=$?
+            set -e
+            PSAFE=$(printf '%s' "$POUT" | sed -e "s|${ARCHIVE_TOKEN}|<redacted>|g" -e 's|x-access-token:[^@]*@|<redacted>@|g')
+            echo "push attempt $n/$ATTEMPTS -> exit $PRC"
+            echo "push said: $PSAFE"
+            if [ "$PRC" -eq 0 ]; then
+              break
+            fi
+            if [ -n "$WAIT" ]; then
+              echo "::warning::push attempt $n failed (exit $PRC); retrying in ${WAIT}s."
+              echo "::warning::Same plain push, no force variant."
+              sleep "$WAIT"
+            fi
+          done
           if [ "$PRC" -ne 0 ]; then
-            echo "::error::PUSH FAILED (exit $PRC). Not force-pushing; reporting instead."
-            exit 1
+            echo "::warning::all $ATTEMPTS push attempts returned non-zero. Asking the"
+            echo "::warning::remote anyway - a push can land and still report an error,"
+            echo "::warning::and a VERIFIED SHA is the only definition of a pass."
           fi
 
           # Independent confirmation: ask the REMOTE what it now holds.
@@ -317,9 +387,19 @@ jobs:
           REMOTE_SHA=$(printf '%s' "$LSAFE" | awk 'NR==1{print $1}')
           echo "ls-remote refs/heads/$BRANCH -> $LSAFE"
           if [ "$LRC" -ne 0 ] || [ "$SHA" != "$REMOTE_SHA" ]; then
-            echo "::error::VERIFICATION FAILED. local $SHA != remote '$REMOTE_SHA'."
-            echo "::error::The push reported success but the branch does not carry it."
+            if [ "$PRC" -ne 0 ]; then
+              echo "::error::PUSH FAILED after $ATTEMPTS attempts (last exit $PRC)"
+              echo "::error::and the remote does not carry $SHA. Not force-pushing."
+            else
+              echo "::error::VERIFICATION FAILED. local $SHA != remote '$REMOTE_SHA'."
+              echo "::error::The push reported success but the branch does not carry it."
+            fi
             exit 1
+          fi
+          if [ "$PRC" -ne 0 ]; then
+            echo "NOTE: the push reported exit $PRC, but the remote provably carries"
+            echo "      $SHA. That is a PASS - a push can land and still report an"
+            echo "      error, and ls-remote is what decides."
           fi
           echo "VERIFIED: $BRANCH on the archive repository is now $SHA"
           echo "pushed=verified" >> "$GITHUB_OUTPUT"
