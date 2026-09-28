@@ -8,6 +8,75 @@ name: Intraday Paper Trader
 # The strategy squares off ALL positions at 15:15 IST, so nothing is ever held
 # overnight; between-day state is just cash balance + trade history.
 
+# ---------------------------------------------------------------------------
+# WHY A SESSION CAN END WITH ZERO OPTION TRADES, AND NOT BE BROKEN
+#
+# On the trading day BEFORE A MONTHLY EXPIRY the options book takes no
+# position at all. A green run with no option trades on that one day is
+# expected. Do not go looking for a fault.
+#
+# WHAT HAPPENS. Every underlying's nearest listed contract is at DTE 1 that
+# day. The entry floor `min_dte = 2` rejects it, and a DTE rejection DROPS
+# the candidate rather than advancing it to the next listed expiry - so every
+# candidate is dropped and nothing is entered.
+#
+# WHY IT HITS EVERYTHING AT ONCE. Single stocks and BANKNIFTY list MONTHLY
+# contracts only; NIFTY also lists weeklies. On an ordinary Monday before a
+# weekly expiry only the NIFTY candidates are caught, because the stocks are
+# still pointing at a distant monthly. On the day before a MONTHLY expiry the
+# weekly and the monthly fall on the same date and nothing has anywhere else
+# to point.
+#
+# HOW OFTEN. Structurally about once a month - roughly 4-5% of sessions.
+# Seen once in the instrumented record: 2026-09-28, when 1,177 of 1,177
+# candidates were rejected `dte_below_min(1<2)` against expiry 2026-09-29,
+# across all 20 underlyings. That one session is 98.3% of every DTE rejection
+# ever recorded. Seen once more before the instrumentation existed, on
+# 2026-08-24, known only from a written account.
+#
+# IT IS NOT A FAULT. All three rules behave exactly as written - the floor
+# (stabilization.py, CHANGE 2), the 0DTE exclusion inside `nearest_expiry`,
+# and the no-roll rule. The blackout is an interaction between them that none
+# of them anticipated, not a defect in any of them. It clears by itself the
+# next session: the expiring contracts become 0DTE, `nearest_expiry` skips
+# them, and selection moves on to the following expiry.
+#
+# ITS COST IS UNKNOWN, WHICH IS NOT THE SAME AS ZERO. The blocked candidates
+# never reached the contract lookup, the quote, the spread gate, the position
+# cap or the selection stage - `quote_snapshot_id` and `spread_pct` are NULL
+# on all 1,177 - so that number is NOT a count of trades that would have
+# happened. For scale, on 2026-09-25 the same funnel took 523 candidates down
+# to 8 entries. Whether blocking them cost money or saved money depends on
+# the expectancy of the options book, which is not established.
+#
+# SOURCE. The rules arrived in 8428c38f (the floor and the no-roll rule,
+# 2026-08-26) and 108a2938 (`nearest_expiry`, 2026-07-30). Read those two
+# commit messages before changing anything here.
+#
+# ONE STALE CRITERION, FOR THE NEXT READER. The acceptance table in
+# STABILIZATION-WED-2026-08-26.md predicts "DTE rejections: exactly 0" and
+# calls a non-zero `rejected_dte` a DEFECT. That applied to ONE session,
+# 2026-08-26, and is not a standing health criterion. Nothing executable
+# asserts it. That document is a dated record of what was believed then and
+# has deliberately been left as written.
+# ---------------------------------------------------------------------------
+#
+# OPEN ITEM: `min_dte = 2` IS STILL LABELLED TEMPORARY
+#
+# Shipped 2026-08-26 in 8428c38f, explicitly as a temporary floor, on the
+# rationale that it was "the least restrictive value that removes every
+# observed DTE 0-1 trade" and that "DTE 2-3 has ZERO in-sample observations,
+# so 2 and 4 are behaviourally identical on all historical data."
+#
+# It has not been revisited since. Recorded here with its ship date so that
+# the word TEMPORARY does not become permanent by forgetting.
+#
+# This is a record, not a task, and it carries no due date. Revisiting the
+# floor is not the next thing to do: the upstream question is whether the
+# confluence signal clears its own 54.95% options round-trip breakeven, and
+# at a measured 46-49% directional accuracy it does not.
+# ---------------------------------------------------------------------------
+
 on:
   # No internal `schedule:` trigger - GitHub's own cron scheduler is
   # documented "best effort" and was observed firing only ~1-2x/day instead
