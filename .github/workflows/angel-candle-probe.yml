@@ -1,0 +1,93 @@
+name: Angel Candle Probe (read only)
+
+# Settles ONE fact: does Angel One serve ONE_MINUTE historical candles for
+# NFO option tokens? Phase 6B's disposition is C if yes; its D contingency
+# applies if no. Contracts and requests are pre-registered in
+# backtest-machine/angel_candle_probe.py - at most 12 getCandleData calls,
+# spaced >= 1.0 s apart.
+#
+# WHY THIS IS SAFE
+#   * READ ONLY. Login and getCandleData only. No order, position, funds or
+#     streaming call; no state restore or save; no dashboard publish.
+#   * `permissions: contents: read`, and checkout does not persist even that
+#     token. No write credential of any kind reaches this job.
+#   * workflow_dispatch ONLY. No schedule, no push trigger.
+#   * Output leaves the runner only as a workflow artifact, and only after
+#     the probe has scanned it for every credential value (a short all-digit
+#     PIN excepted - it is never returned by any API), session token, JWT
+#     shape and Bearer header.
+#
+# CONCURRENCY
+#   Joins the trader's `intraday-trader` group, like every other Angel
+#   research workflow, so this probe's Angel login can never overlap a live
+#   trading cycle: whichever starts second waits for the first.
+#
+# TIMING
+#   Refuses to run 09:15-15:30 IST on a weekday. There is no override.
+#   Because this job shares the trader's concurrency group, a run started
+#   during the session would also queue the live trader behind it.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  # SAME group as the trader: a probe must never overlap a live cycle.
+  group: intraday-trader
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Kolkata
+    steps:
+      - name: Refuse to run during market hours
+        run: |
+          set -euo pipefail
+          dow=$(date +%u); hm=$(date +%H%M)
+          echo "IST now: $(date '+%Y-%m-%d %H:%M %A')"
+          if [ "$dow" -le 5 ] && [ "$hm" -ge 0915 ] && [ "$hm" -le 1530 ]; then
+            echo "::error::09:15-15:30 IST on a weekday. Re-dispatch after 15:30."
+            exit 1
+          fi
+          echo "Outside market hours - proceeding."
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: backtest-machine/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r backtest-machine/requirements.txt
+
+      - name: Probe ONE_MINUTE NFO candles
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+        run: |
+          set -o pipefail
+          cd backtest-machine
+          python angel_candle_probe.py
+
+      # always(): a login failure or a stopped run still leaves its record.
+      - name: Upload probe result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: angel-candle-probe
+          path: backtest-machine/candle_probe_out/
+          retention-days: 30
+          if-no-files-found: warn
