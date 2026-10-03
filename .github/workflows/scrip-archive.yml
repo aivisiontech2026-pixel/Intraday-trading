@@ -30,7 +30,8 @@ name: Scrip Master Token Archive (no credentials)
 #   Configure two things, then this becomes durable:
 #     secrets.ARCHIVE_REPO_TOKEN  fine-grained PAT, Contents: read+write,
 #                                 scoped to the archive repository ONLY
-#     vars.ARCHIVE_REPO           e.g. your-account/scrip-archive
+#     secrets.ARCHIVE_REPO        owner/name of the archive repository. A SECRET,
+#                                 not a variable, so its value is masked in logs.
 #
 #   Until they are set the job still runs, still reports, and uploads the
 #   registry as a 90-day artifact - but it CANNOT compute day-over-day deltas,
@@ -153,17 +154,6 @@ name: Scrip Master Token Archive (no credentials)
 #                 run. Missing it loses only the retirement DATE, which is
 #                 recoverable from any later run's first_seen/last_seen.
 #
-# TODO 2026-10-01: remove the `archive target: ${ARCHIVE_REPO}` echo in the
-#   fetch step. It is a deliberate, time-boxed disclosure - this repository is
-#   public, so that line publishes a private repository's name. It stays
-#   through the 09-29/09-30 expiry because a wrong-repo failure passes every
-#   other check silently, and the name is the only thing that catches it.
-#   After 2026-10-01 it has served its purpose and must come out. A
-#   fingerprint variant (sha256 prefix of the name) was proposed as a
-#   permanent replacement and DEFERRED; note that it is a tamper indicator,
-#   not a confidentiality measure - `owner/name` is low-entropy and a hash
-#   prefix of it is brute-forceable.
-#
 # CONCURRENCY: its own group. It shares no resource with the trader - no Angel
 # session, no rate limit, no state - so putting it in `intraday-trader` would
 # only risk queueing the trader behind it for no benefit.
@@ -186,7 +176,7 @@ jobs:
     timeout-minutes: 20
     env:
       TZ: Asia/Kolkata
-      ARCHIVE_REPO: ${{ vars.ARCHIVE_REPO }}
+      ARCHIVE_REPO: ${{ secrets.ARCHIVE_REPO }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -221,11 +211,6 @@ jobs:
             exit 0
           fi
           echo "configured=true" >> "$GITHUB_OUTPUT"
-          # A repository NAME is not a credential. GitHub masks secrets in logs
-          # and does not mask variables, precisely because variables are not
-          # secret. Printing it lets the run answer the wrong-repo question in
-          # its own log instead of by eye. The TOKEN is never printed.
-          echo "archive target: ${ARCHIVE_REPO}"
           URL="https://x-access-token:${ARCHIVE_TOKEN}@github.com/${ARCHIVE_REPO}.git"
 
           # Capture stderr rather than discarding it. It is NEVER printed raw:
@@ -452,8 +437,8 @@ jobs:
             echo "::error::uploaded as an artifact, so nothing is lost today - but"
             echo "::error::the archive repository was not reachable and the"
             echo "::error::disappeared-token comparison could not be made."
-            echo "::error::Check the 'archive target:' line above against the"
-            echo "::error::repository you expect, and check the PAT's scope."
+            echo "::error::Check that the ARCHIVE_REPO secret names the intended"
+            echo "::error::repository, and check the PAT's scope."
             exit 1
           fi
           if [ "$PUSHED" != "verified" ] && [ "$PUSHED" != "unchanged" ]; then
